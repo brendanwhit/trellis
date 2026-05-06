@@ -14,18 +14,21 @@ Make on-disk worktrees discoverable and adoptable through a dedicated screen, wi
 
 ## Discovery
 
-For each repo in the DB, run `git worktree list --porcelain` (already exposed via `git::list_worktrees`). Drop two kinds of entries:
+For each repo in the DB, run `git worktree list --porcelain` (already exposed via `git::list_worktrees`). Drop these entries:
 
 1. The repo's main worktree itself (path equals `repo.path`).
 2. Any path already present as `worktrees.path` in the DB.
+3. Detached-HEAD entries — adopting them as sessions has no sensible `base_branch`.
+4. Entries whose directory no longer exists on disk (`!Path::new(&path).is_dir()`). `git worktree list` will continue to report worktrees whose directories were deleted out from under it until `git worktree prune` runs; without this check, adoption would create a session pointing at a missing directory.
 
-What remains is the orphan set: worktrees git knows about that Trellis doesn't. Detached-HEAD worktrees are skipped — adopting them as sessions has no sensible `base_branch`.
+What remains is the orphan set: worktrees git knows about, that exist on disk, that Trellis doesn't track.
 
-This avoids the "bloat with worktrees that linger after merge" failure mode by construction:
+The combination of filters 2 and 4 is what prevents the "bloat with worktrees that linger after merge" failure mode:
 
-- Cleanup removes both the directory and the DB row, so git stops listing the path; it can't reappear in discovery.
-- `delete_session` without cleanup keeps the worktree row (with `session_id = NULL`); discovery still excludes it because the path is in the DB.
-- The only way an entry shows up is if git tracks it and Trellis genuinely never has — which is exactly the target case.
+- `cleanup_worktree` succeeds → directory and DB row both gone → not listed.
+- `cleanup_worktree` partially succeeds (git remove failed but directory is already gone) → DB row deleted (per `manager.rs:441-447`), directory absent → filter 4 still excludes it from discovery even if `git worktree list` is stale.
+- `delete_session(cleanup_worktrees=false)` → row stays with `session_id = NULL` → filter 2 excludes it.
+- A genuinely orphaned-after-the-fact case (DB row dropped but directory still on disk) → would surface in discovery, and that's correct: the user can re-adopt or delete the directory.
 
 ## UI
 
@@ -50,7 +53,7 @@ Path uses the existing `truncate_start` helper so the leaf segment stays visible
 
 Footer shows the keybinds in the same style the other screens use. Empty state renders "No untracked worktrees found." with a hint to use `n` to create new sessions.
 
-The screen refreshes its discovery on `new()` and on `on_resume()` so the list stays accurate after an adopt or after returning from another screen.
+The screen refreshes its discovery on `new()` and on `on_resume()` so the list stays accurate after returning from another screen. (Cleanup and history don't override `on_resume` today; this is a deliberate divergence — the orphan set is cheap to recompute, and freshness matters here in a way it doesn't for cleanup's background staleness check.)
 
 ## Adopt Flow
 
@@ -59,10 +62,11 @@ The screen refreshes its discovery on `new()` and on `on_resume()` so the list s
 On confirm:
 
 1. Validate the name is non-empty.
-2. Reject if `manager.get_session_by_name(name)` returns Some — show inline error, keep the prompt open for editing.
-3. Call `manager.adopt_worktree(repo_id, path, branch, session_name)`.
-4. On success, write a `SwitchAction::Session { target: name }` and quit the TUI — the same exit path `n` (new session) and `R` (review) take.
-5. On error, show the message inline and let the user retry or cancel.
+2. Reject if `manager.get_session_by_name(name)` returns `Some` (DB-managed collision) — show inline error, keep the prompt open.
+3. Reject if `tmux::session_exists(name)` returns true (live unmanaged tmux session collision) — show inline error, keep the prompt open. Both checks are needed: `get_session_by_name` only sees DB-managed sessions, and `apply_layout` would silently no-op against an existing tmux session, leaving a Trellis-managed DB session glued onto someone else's tmux state.
+4. Call `manager.adopt_worktree(repo_id, path, branch, session_name)`.
+5. On success, write a `SwitchAction::Session { target: name }` and quit the TUI — the same exit path `n` (new session) and `R` (review) take.
+6. On error, show the message inline and let the user retry or cancel.
 
 ## Manager API
 
@@ -86,19 +90,31 @@ pub fn adopt_worktree(
 ) -> Result<Session, String>;
 ```
 
-`list_orphan_worktrees`:
+`list_orphan_worktrees` is split into a pure filter and a thin IO wrapper, to keep the discovery logic testable without mocking git:
 
-- Iterates `db::get_repos`, calls `git::list_worktrees` per repo.
-- Filters out the repo's main path and any path already in `db::get_worktrees`.
-- Filters out detached-HEAD entries. `git::list_worktrees` sets `branch = Some("(detached)")` for these (see `git.rs` `if line == "detached"`), so the filter is `branch != "(detached)"`. Also drops entries with `branch.is_none()` defensively, even though the parser doesn't currently produce them.
-- Sorts by `repo.name`, then `branch`, for stable display.
+```rust
+// Pure: no IO. Used directly by tests.
+fn filter_orphans(
+    repos: &[Repo],
+    tracked_paths: &HashSet<String>,
+    git_results: &HashMap<i64, Vec<GitWorktree>>,
+) -> Vec<OrphanWorktree>;
 
-`adopt_worktree`:
+// Public: gathers DB + git inputs, calls the pure function.
+pub fn list_orphan_worktrees(&self) -> Vec<OrphanWorktree>;
+```
 
-- Insert a `worktree` row (path, branch, repo_id, session_id pointing at the session created in the next step).
-- Insert a `session` row (name, repo_id, base_branch = the worktree's branch).
-- Call the existing `manager::apply_layout(name, path)` to create the tmux session with the default `claude` + `shell` window layout.
-- Return the new `Session`.
+The wrapper iterates `db::get_repos`, calls `git::list_worktrees` per repo, **pre-prunes any entry whose path is missing on disk** (filter 4 from §Discovery — `Path::new(&p).is_dir()`), builds the tracked-path set from `db::get_worktrees`, and hands the result to `filter_orphans`. `filter_orphans` applies the remaining three filters (main-path, DB-tracked-path, detached-HEAD) from §Discovery and sorts by `repo.name`, then `branch`, for stable display. Splitting it this way keeps `filter_orphans` IO-free and unit-testable.
+
+For the detached-HEAD filter: `git::list_worktrees` sets `branch = Some("(detached)")` for detached entries (see `git.rs` `if line == "detached"`), so the filter is `branch != "(detached)"`. The parser never returns `None` for `branch` in current input, but the filter handles `None` defensively anyway.
+
+`adopt_worktree` is structured tmux-first to avoid leaving DB rows pointing at a non-existent tmux session if the layout fails:
+
+1. `apply_layout(name, path)` — creates the tmux session and applies the default `claude` + `shell` layout. **This requires changing `apply_layout` to return `Result<(), TmuxError>`** instead of swallowing errors silently. The two existing call sites (`create_session`, `checkout_and_review`) get updated to propagate the error — fixing a parallel latent bug.
+2. If the layout call fails, return the error without touching the DB.
+3. Insert the `session` row (name, repo_id, base_branch = the worktree's branch).
+4. Insert the `worktree` row with `session_id` pointing at the session just inserted.
+5. Return the new `Session`.
 
 This is deliberately the same shape as `create_session`, minus the `git worktree add` step. No reuse of `create_session` itself, since its branch-vs-default logic doesn't apply when the path is already known.
 
@@ -111,7 +127,7 @@ This is deliberately the same shape as `create_session`, minus the `git worktree
 
 ## Files Touched
 
-- `src/manager.rs` — add `OrphanWorktree`, `list_orphan_worktrees`, `adopt_worktree`.
+- `src/manager.rs` — add `OrphanWorktree`, `list_orphan_worktrees`, `filter_orphans`, `adopt_worktree`. Change `apply_layout` to return `Result<(), TmuxError>`. Update `create_session` and `checkout_and_review` to propagate the error.
 - `src/tui/adopt_worktree.rs` — new screen.
 - `src/tui/mod.rs` — register module.
 - `src/tui/session_list.rs` — add `A` keybind, footer entry.
@@ -120,6 +136,7 @@ This is deliberately the same shape as `create_session`, minus the `git worktree
 
 ## Tests
 
-- `manager::list_orphan_worktrees` — DB fixtures for repos + tracked worktrees, mock `git::list_worktrees` results, assert filtering. Existing tests in `db.rs` and `manager.rs` already use in-memory SQLite as a pattern; follow that. The git call needs an injection seam — easiest is to take a closure or pass a list-fn into the function for testability, mirroring how nothing else in `manager.rs` is tested against real git today. If injecting feels heavy, integration-test it manually and unit-test the filter logic against a fixed input list.
-- `manager::adopt_worktree` — assert the worktree and session rows land in the DB and reference each other. Skip the tmux side.
-- No new tests for the screen itself; matches the existing pattern.
+- `manager::filter_orphans` — pure function, fully unit-testable. Cover: main-path exclusion, DB-tracked-path exclusion, detached-HEAD exclusion, sort order, multi-repo input. No git, no DB, no tmux.
+- `manager::list_orphan_worktrees` — not directly tested. The IO wrapper is small; the data-shaping logic is covered by `filter_orphans` and the missing-directory filter is a one-line `is_dir()` check.
+- `manager::adopt_worktree` — assert the session and worktree rows land in the DB and reference each other after a successful adopt. Skip the tmux side. (The DB tests already use in-memory SQLite via the pattern in `db.rs::test_conn`.)
+- No new tests for the screen itself; matches the existing pattern across `tui/`.
