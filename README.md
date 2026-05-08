@@ -20,7 +20,7 @@ This installs the `trellis` binary into `~/.cargo/bin`. Add a tmux keybind to la
 bind -n M-s display-popup -E -w 80% -h 70% "trellis"
 ```
 
-On first launch, trellis scans your repos and worktrees directories (configurable via `S` settings) and discovers live tmux sessions.
+On first launch, trellis opens its settings screen so you can confirm where your repos and worktrees live (defaults: `~/dev` and `~/dev/worktrees`). Once you close settings, trellis scans those directories and discovers live tmux sessions.
 
 ## What it does
 

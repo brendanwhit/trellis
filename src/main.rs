@@ -21,12 +21,9 @@ fn main() {
     let first_run = !db_path.exists();
     let conn = db::init_db(&db_path);
     let mgr = manager::Manager::new(conn);
-    if first_run {
-        mgr.scan_existing();
-    }
 
     let mut terminal = ratatui::init();
-    let mut app = tui::App::new(mgr);
+    let mut app = tui::App::new(mgr, first_run);
     app.run(&mut terminal);
     ratatui::restore();
 
