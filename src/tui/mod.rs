@@ -6,11 +6,13 @@ pub mod confirm;
 pub mod help;
 pub mod new_session;
 pub mod adopt_session;
+pub mod adopt_worktree;
 pub mod rename;
 pub mod edit_branch;
 pub mod history;
 pub mod cleanup;
 pub mod settings;
+pub mod working;
 
 /// A lightweight repo stand-in (name + path, no DB id required).
 /// Used by wizard screens that let the user pick a repo.
@@ -120,14 +122,20 @@ pub struct App {
     pub manager: Manager,
     screen_stack: Vec<Box<dyn ScreenBehavior>>,
     should_quit: bool,
+    /// On first run we open Settings on top of the (empty) session list and
+    /// defer `scan_existing` until that Settings screen closes — otherwise
+    /// the scan runs against the seeded `~/dev` defaults before the user has
+    /// a chance to point at their actual repos directory.
+    pending_initial_scan: bool,
 }
 
 impl App {
-    pub fn new(manager: Manager) -> Self {
+    pub fn new(manager: Manager, first_run: bool) -> Self {
         Self {
             manager,
             screen_stack: Vec::new(),
             should_quit: false,
+            pending_initial_scan: first_run,
         }
     }
 
@@ -141,6 +149,13 @@ impl App {
         // Push initial screen
         let initial = session_list::SessionListScreen::new(&self.manager);
         self.screen_stack.push(Box::new(initial));
+
+        // First-run: open Settings so the user can confirm or change repos_dir
+        // / worktrees_dir before any scanning happens.
+        if self.pending_initial_scan {
+            let settings = settings::SettingsScreen::new(&self.manager);
+            self.screen_stack.push(Box::new(settings));
+        }
 
         while !self.should_quit {
             // Draw
@@ -203,6 +218,12 @@ impl App {
                 if self.screen_stack.is_empty() {
                     self.should_quit = true;
                 } else if let Some(top) = self.screen_stack.last_mut() {
+                    // First-run scan happens once the Settings screen closes,
+                    // so it runs against whatever dirs the user just confirmed.
+                    if self.pending_initial_scan {
+                        self.manager.scan_existing();
+                        self.pending_initial_scan = false;
+                    }
                     top.on_resume(&mut self.manager);
                 }
             }
