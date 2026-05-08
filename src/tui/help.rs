@@ -35,6 +35,11 @@ fn help_lines() -> Vec<Line<'static>> {
         ]),
         Line::from(vec![
             Span::raw("  "),
+            Span::styled("A", Style::default().fg(theme::ACCENT)),
+            Span::styled("         Adopt orphan worktree", Style::default().fg(theme::TEXT)),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
             Span::styled("d", Style::default().fg(theme::ACCENT)),
             Span::styled("         Delete session or kill tab", Style::default().fg(theme::TEXT)),
         ]),
