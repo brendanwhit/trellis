@@ -230,14 +230,13 @@ Discovery side. `filter_orphans` is the pure function (testable, no IO). `list_o
 
 - [ ] **Step 1: Add the `OrphanWorktree` struct and `filter_orphans` signature stub**
 
-In `src/manager.rs`, add after the existing imports (top of file, after `use crate::utils::utc_now;`):
+In `src/manager.rs`, add this single import alongside the existing imports (top of file, near `use crate::tmux;`):
 
 ```rust
-use std::collections::HashSet;
 use crate::git::GitWorktree;
 ```
 
-(Note: `HashMap`/`HashSet` is already imported at the top of the file via `use std::collections::{HashMap, HashSet};` — verify and skip the duplicate import. Just add the `GitWorktree` import.)
+(`HashMap` and `HashSet` are already imported via `use std::collections::{HashMap, HashSet};` — don't add duplicates.)
 
 Add this struct after the existing `Manager` struct definition but before `impl Manager` (around `src/manager.rs:71`):
 
@@ -490,6 +489,8 @@ git commit -m "feat: discover orphan worktrees via filter_orphans + list_orphan_
 ### Task 3: Add adoption: `persist_adopted_worktree` (with test) and `adopt_worktree`
 
 Adoption side. The DB writes are split into a private helper (`persist_adopted_worktree`) so the test can exercise just the DB behavior without touching tmux. The public `adopt_worktree` calls `apply_layout` first, then the helper.
+
+**Note on test scope.** The spec asks for a test of `adopt_worktree` that asserts the rows land and reference each other. The plan tests `persist_adopted_worktree` instead, because invoking the public method requires a live tmux process (which the test environment doesn't have). The helper-test exercises the same behavior the spec is concerned with — DB rows landing correctly and the session/worktree linkage — without the tmux dependency. This is a deliberate deviation from a literal reading of the spec.
 
 **Files:**
 - Modify: `src/manager.rs`
@@ -975,38 +976,20 @@ impl ScreenBehavior for AdoptWorktreeScreen {
 
 - [ ] **Step 2: Register the module in `src/tui/mod.rs`**
 
-In `src/tui/mod.rs`, find the existing module registrations (lines 3-13):
+In `src/tui/mod.rs`, find this line:
 
 ```rust
-pub mod theme;
-pub mod session_list;
-pub mod confirm;
-pub mod help;
-pub mod new_session;
 pub mod adopt_session;
-pub mod rename;
-pub mod edit_branch;
-pub mod history;
-pub mod cleanup;
-pub mod settings;
 ```
 
-Add `pub mod adopt_worktree;` after `pub mod adopt_session;`:
+Add `pub mod adopt_worktree;` on the line immediately after it:
 
 ```rust
-pub mod theme;
-pub mod session_list;
-pub mod confirm;
-pub mod help;
-pub mod new_session;
 pub mod adopt_session;
 pub mod adopt_worktree;
-pub mod rename;
-pub mod edit_branch;
-pub mod history;
-pub mod cleanup;
-pub mod settings;
 ```
+
+(Other `pub mod` declarations may exist before/after — leave them as-is.)
 
 - [ ] **Step 3: Build to verify**
 
