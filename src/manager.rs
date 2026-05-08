@@ -20,11 +20,8 @@ const DEFAULT_LAYOUT: &[(&str, Option<&str>)] = &[
 ];
 
 /// Create a tmux session and set up windows according to the default layout.
-pub fn apply_layout(session_name: &str, working_dir: &str) {
-    // Create the session
-    if let Err(_) = tmux::new_session(session_name, working_dir) {
-        return;
-    }
+pub fn apply_layout(session_name: &str, working_dir: &str) -> Result<(), tmux::TmuxError> {
+    tmux::new_session(session_name, working_dir)?;
 
     for (i, &(name, command)) in DEFAULT_LAYOUT.iter().enumerate() {
         if i == 0 {
@@ -38,8 +35,8 @@ pub fn apply_layout(session_name: &str, working_dir: &str) {
         }
     }
 
-    // Focus the first window
     let _ = tmux::select_window(session_name, 1);
+    Ok(())
 }
 
 /// Detect subsystem directories in a monorepo (e.g. workers/model_train, src/sojourner).
@@ -185,6 +182,16 @@ impl Manager {
             wt_path
         };
 
+        let effective_dir = if let Some(sub) = subdirectory {
+            Path::new(&start_dir).join(sub).to_string_lossy().to_string()
+        } else {
+            start_dir.clone()
+        };
+
+        // tmux first — fail loudly before touching the DB.
+        apply_layout(session_name, &effective_dir)
+            .map_err(|e| format!("Failed to create tmux session: {}", e))?;
+
         let session = db::add_session(
             &self.conn,
             &Session {
@@ -196,14 +203,6 @@ impl Manager {
                 last_selected_at: None,
             },
         );
-
-        let effective_dir = if let Some(sub) = subdirectory {
-            Path::new(&start_dir).join(sub).to_string_lossy().to_string()
-        } else {
-            start_dir.clone()
-        };
-
-        apply_layout(session_name, &effective_dir);
 
         // Record worktree if we created one
         if start_dir != repo_path {
@@ -332,7 +331,10 @@ impl Manager {
             return Ok((s, wt_path));
         }
 
-        // Create session
+        // tmux first — fail loudly before touching the DB.
+        apply_layout(&session_name, &wt_path)
+            .map_err(|e| format!("Failed to create tmux session: {}", e))?;
+
         let session = db::add_session(
             &self.conn,
             &Session {
@@ -344,7 +346,6 @@ impl Manager {
                 last_selected_at: None,
             },
         );
-        apply_layout(&session_name, &wt_path);
 
         // Record worktree
         db::add_worktree(
