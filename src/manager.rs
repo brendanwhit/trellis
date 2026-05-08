@@ -413,6 +413,56 @@ impl Manager {
         Ok((session, wt_path))
     }
 
+    /// Insert the session and worktree rows for a freshly-adopted worktree.
+    /// Private helper — `adopt_worktree` is the public entry point.
+    fn persist_adopted_worktree(
+        &self,
+        repo_id: i64,
+        path: &str,
+        branch: &str,
+        session_name: &str,
+    ) -> Session {
+        let session = db::add_session(
+            &self.conn,
+            &Session {
+                id: None,
+                name: session_name.to_string(),
+                repo_id,
+                base_branch: branch.to_string(),
+                created_at: utc_now(),
+                last_selected_at: None,
+            },
+        );
+        db::add_worktree(
+            &self.conn,
+            &Worktree {
+                id: None,
+                repo_id,
+                session_id: session.id,
+                path: path.to_string(),
+                branch: branch.to_string(),
+                tmux_window: None,
+                created_at: utc_now(),
+            },
+        );
+        session
+    }
+
+    /// Wrap a managed session around an existing on-disk worktree. Runs tmux
+    /// first so a layout failure never leaves DB rows pointing at a
+    /// non-existent tmux session.
+    pub fn adopt_worktree(
+        &self,
+        repo_id: i64,
+        path: &str,
+        branch: &str,
+        session_name: &str,
+    ) -> Result<Session, String> {
+        apply_layout(session_name, path)
+            .map_err(|e| format!("Failed to create tmux session: {}", e))?;
+        Ok(self.persist_adopted_worktree(repo_id, path, branch, session_name))
+    }
+
     /// Create a worktree + tmux window for the given session.
     pub fn add_tab(&self, session_id: i64, branch_name: &str) -> Result<Worktree, String> {
         let session = self
@@ -874,6 +924,19 @@ impl Manager {
 mod tests {
     use super::*;
     use crate::git::GitWorktree;
+    use rusqlite::Connection;
+
+    fn make_test_manager() -> Manager {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE repos (id INTEGER PRIMARY KEY, path TEXT NOT NULL, name TEXT NOT NULL, default_branch TEXT NOT NULL);
+             CREATE TABLE sessions (id INTEGER PRIMARY KEY, name TEXT NOT NULL, repo_id INTEGER NOT NULL, base_branch TEXT NOT NULL, created_at TEXT NOT NULL, last_selected_at TEXT, FOREIGN KEY (repo_id) REFERENCES repos(id));
+             CREATE TABLE worktrees (id INTEGER PRIMARY KEY, session_id INTEGER, repo_id INTEGER NOT NULL, path TEXT NOT NULL, branch TEXT NOT NULL, tmux_window INTEGER, created_at TEXT NOT NULL, FOREIGN KEY (session_id) REFERENCES sessions(id), FOREIGN KEY (repo_id) REFERENCES repos(id));
+             CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        ).unwrap();
+        Manager::new(conn)
+    }
 
     fn make_repo(id: i64, name: &str, path: &str) -> Repo {
         Repo {
@@ -982,5 +1045,38 @@ mod tests {
         let git_results: HashMap<i64, Vec<GitWorktree>> = HashMap::new();
         let result = filter_orphans(&[repo], &HashSet::new(), &git_results);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn persist_adopted_worktree_writes_session_and_worktree_rows() {
+        let mgr = make_test_manager();
+        let repo = db::add_repo(
+            &mgr.conn,
+            &Repo {
+                id: None,
+                path: "/dev/trellis".into(),
+                name: "trellis".into(),
+                default_branch: "main".into(),
+            },
+        );
+        let session = mgr.persist_adopted_worktree(
+            repo.id.unwrap(),
+            "/wt/trellis/feat-a",
+            "feat-a",
+            "trellis-feat-a",
+        );
+
+        assert_eq!(session.name, "trellis-feat-a");
+        assert_eq!(session.repo_id, repo.id.unwrap());
+        assert_eq!(session.base_branch, "feat-a");
+        let from_db = db::get_session_by_name(&mgr.conn, "trellis-feat-a").unwrap();
+        assert_eq!(from_db.id, session.id);
+
+        let worktrees = db::get_worktrees_for_session(&mgr.conn, session.id.unwrap());
+        assert_eq!(worktrees.len(), 1);
+        assert_eq!(worktrees[0].path, "/wt/trellis/feat-a");
+        assert_eq!(worktrees[0].branch, "feat-a");
+        assert_eq!(worktrees[0].repo_id, repo.id.unwrap());
+        assert_eq!(worktrees[0].session_id, session.id);
     }
 }
