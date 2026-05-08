@@ -142,6 +142,10 @@ enum ConfirmAction {
 enum InlineMode {
     None,
     Confirm { message: String, action: ConfirmAction },
+    /// Set when the user has confirmed a slow action; the next tick runs it.
+    /// The render loop draws a "Working…" overlay so the previous frame
+    /// (typically the confirm prompt) doesn't appear frozen during the call.
+    Working { action: ConfirmAction },
     Rename { input: String, cursor: usize, is_session: bool, session_id: Option<i64>, session_name: String, window_index: Option<i64> },
     Review { input: String, cursor: usize, repo_index: usize, repos: Vec<Repo> },
     NewTab { input: String, cursor: usize, session_id: i64, session_name: String },
@@ -895,6 +899,11 @@ impl SessionListScreen {
         ScreenAction::Push(Box::new(screen))
     }
 
+    fn action_adopt_worktree(&self, manager: &Manager) -> ScreenAction {
+        let screen = super::adopt_worktree::AdoptWorktreeScreen::new(manager);
+        ScreenAction::Push(Box::new(screen))
+    }
+
     fn action_settings(&self, manager: &Manager) -> ScreenAction {
         let screen = super::settings::SettingsScreen::new(manager);
         ScreenAction::Push(Box::new(screen))
@@ -972,6 +981,7 @@ impl SessionListScreen {
             ("H", "History"),
             (".", "Actions"),
             ("c", "Cleanup"),
+            ("A", "Adopt"),
             ("S", "Settings"),
             ("?", "Help"),
         ])
@@ -1032,7 +1042,7 @@ impl SessionListScreen {
         }
     }
 
-    fn handle_confirm_key(&mut self, code: KeyCode, manager: &mut Manager) -> ScreenAction {
+    fn handle_confirm_key(&mut self, code: KeyCode, _manager: &mut Manager) -> ScreenAction {
         let action = match &self.inline_mode {
             InlineMode::Confirm { action, .. } => action.clone(),
             _ => return ScreenAction::None,
@@ -1040,19 +1050,9 @@ impl SessionListScreen {
 
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                match action {
-                    ConfirmAction::DeleteSession { session_id } => {
-                        let _ = manager.delete_session(session_id, false);
-                    }
-                    ConfirmAction::KillTab { session_name, window_index } => {
-                        let _ = tmux::kill_window(&session_name, window_index);
-                    }
-                    ConfirmAction::KillSession { session_name } => {
-                        let _ = tmux::kill_session(&session_name);
-                    }
-                }
-                self.inline_mode = InlineMode::None;
-                self.refresh(manager);
+                // Defer to tick so the "Working…" overlay paints before the
+                // (potentially slow) git/tmux call starts.
+                self.inline_mode = InlineMode::Working { action };
                 ScreenAction::None
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -1061,6 +1061,27 @@ impl SessionListScreen {
             }
             _ => ScreenAction::None,
         }
+    }
+
+    fn run_pending_work(&mut self, manager: &mut Manager) {
+        let action = match &self.inline_mode {
+            InlineMode::Working { action } => action.clone(),
+            _ => return,
+        };
+
+        match action {
+            ConfirmAction::DeleteSession { session_id } => {
+                let _ = manager.delete_session(session_id, false);
+            }
+            ConfirmAction::KillTab { session_name, window_index } => {
+                let _ = tmux::kill_window(&session_name, window_index);
+            }
+            ConfirmAction::KillSession { session_name } => {
+                let _ = tmux::kill_session(&session_name);
+            }
+        }
+        self.inline_mode = InlineMode::None;
+        self.refresh(manager);
     }
 
     fn handle_review_key(&mut self, code: KeyCode, modifiers: crossterm::event::KeyModifiers, manager: &mut Manager) -> ScreenAction {
@@ -1206,6 +1227,7 @@ impl ScreenBehavior for SessionListScreen {
 
         let status_height = match &self.inline_mode {
             InlineMode::None => if self.status_message.is_some() { 1 } else { 0 },
+            InlineMode::Working { .. } => 0,
             _ => 1,
         };
 
@@ -1276,6 +1298,9 @@ impl ScreenBehavior for SessionListScreen {
                 let status = Paragraph::new(message.as_str())
                     .style(Style::default().fg(theme::YELLOW).bg(theme::BG));
                 f.render_widget(status, chunks[2]);
+            }
+            InlineMode::Working { .. } => {
+                // Overlay is rendered at the end of this method.
             }
             InlineMode::Rename { ref input, cursor: cursor_pos, .. } => {
                 // Show input hint in status line
@@ -1451,6 +1476,15 @@ impl ScreenBehavior for SessionListScreen {
         // Footer
         let footer = self.render_footer();
         f.render_widget(footer, chunks[3]);
+
+        if let InlineMode::Working { action } = &self.inline_mode {
+            let label = match action {
+                ConfirmAction::DeleteSession { .. } => "Deleting session",
+                ConfirmAction::KillTab { .. } => "Killing tab",
+                ConfirmAction::KillSession { .. } => "Killing session",
+            };
+            super::working::render_overlay(f, area, label);
+        }
     }
 
     fn handle_event(&mut self, event: &Event, manager: &mut Manager) -> ScreenAction {
@@ -1488,6 +1522,9 @@ impl ScreenBehavior for SessionListScreen {
         match &self.inline_mode {
             InlineMode::None => {}
             InlineMode::Confirm { .. } => return self.handle_confirm_key(*code, manager),
+            // Drop input while a slow action is in flight; the next tick
+            // runs the action and clears Working back to None.
+            InlineMode::Working { .. } => return ScreenAction::None,
             InlineMode::Rename { .. } => return self.handle_rename_key(*code, *modifiers, manager),
             InlineMode::Review { .. } => return self.handle_review_key(*code, *modifiers, manager),
             InlineMode::NewTab { .. } => return self.handle_new_tab_key(*code, *modifiers, manager),
@@ -1545,6 +1582,7 @@ impl ScreenBehavior for SessionListScreen {
             KeyCode::Char('.') => self.action_action_menu(manager),
             KeyCode::Char('H') => self.action_history(manager),
             KeyCode::Char('c') => self.action_cleanup(manager),
+            KeyCode::Char('A') => self.action_adopt_worktree(manager),
             KeyCode::Char('S') => self.action_settings(manager),
             KeyCode::Char('?') => self.action_help(),
             _ => ScreenAction::None,
@@ -1552,6 +1590,16 @@ impl ScreenBehavior for SessionListScreen {
     }
 
     fn on_child_result(&mut self, _result: ActionResult, _manager: &mut Manager) -> ScreenAction {
+        ScreenAction::None
+    }
+
+    fn tick(&mut self, manager: &mut Manager) -> ScreenAction {
+        // Run deferred slow work the frame after the user confirmed it. Draw
+        // happens before tick in the main loop, so the "Working…" overlay is
+        // already on-screen by the time we block here.
+        if matches!(self.inline_mode, InlineMode::Working { .. }) {
+            self.run_pending_work(manager);
+        }
         ScreenAction::None
     }
 
