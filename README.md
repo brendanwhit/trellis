@@ -56,6 +56,7 @@ On first launch, trellis opens its settings screen so you can confirm where your
 | `.` | Actions menu (change branch, launch claude, adopt) |
 | `H` | Conversation history |
 | `c` | Cleanup worktrees |
+| `A` | Adopt an existing worktree as a new session |
 | `S` | Settings |
 | `?` | Help |
 | `q` | Quit |
