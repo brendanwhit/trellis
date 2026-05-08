@@ -8,6 +8,7 @@ use rusqlite::{params, Connection};
 
 use crate::db;
 use crate::git;
+use crate::git::GitWorktree;
 use crate::models::{Repo, Session, SessionInfo, Worktree};
 use crate::tmux;
 
@@ -18,6 +19,54 @@ const DEFAULT_LAYOUT: &[(&str, Option<&str>)] = &[
     ("claude", Some("claude")),
     ("shell", None),
 ];
+
+/// A worktree git knows about that Trellis hasn't registered yet.
+#[derive(Debug, Clone)]
+pub struct OrphanWorktree {
+    pub repo: Repo,
+    pub branch: String,
+    pub path: String,
+}
+
+/// Pure filter: given repos, the set of paths Trellis already tracks, and
+/// per-repo `git worktree list` results, return the worktrees Trellis should
+/// surface as adoptable. Excludes the repo's main path, anything in
+/// `tracked_paths`, and detached-HEAD entries. The IO-level missing-directory
+/// filter happens in `Manager::list_orphan_worktrees` before calling this.
+fn filter_orphans(
+    repos: &[Repo],
+    tracked_paths: &HashSet<String>,
+    git_results: &HashMap<i64, Vec<GitWorktree>>,
+) -> Vec<OrphanWorktree> {
+    let mut out: Vec<OrphanWorktree> = Vec::new();
+    for repo in repos {
+        let Some(repo_id) = repo.id else { continue };
+        let Some(entries) = git_results.get(&repo_id) else { continue };
+        for entry in entries {
+            if entry.path == repo.path {
+                continue; // main worktree
+            }
+            if tracked_paths.contains(&entry.path) {
+                continue; // already tracked
+            }
+            let Some(branch) = entry.branch.as_ref() else {
+                continue; // defensive: parser doesn't currently produce None
+            };
+            if branch == "(detached)" {
+                continue;
+            }
+            out.push(OrphanWorktree {
+                repo: repo.clone(),
+                branch: branch.clone(),
+                path: entry.path.clone(),
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        a.repo.name.cmp(&b.repo.name).then_with(|| a.branch.cmp(&b.branch))
+    });
+    out
+}
 
 /// Create a tmux session and set up windows according to the default layout.
 pub fn apply_layout(session_name: &str, working_dir: &str) -> Result<(), tmux::TmuxError> {
@@ -790,5 +839,148 @@ impl Manager {
 
     pub fn get_all_worktrees(&self) -> Vec<Worktree> {
         db::get_worktrees(&self.conn)
+    }
+
+    /// Discover worktrees git knows about (per registered repo) that Trellis
+    /// doesn't track. Filters out missing directories on disk before delegating
+    /// the data filter to `filter_orphans`.
+    pub fn list_orphan_worktrees(&self) -> Vec<OrphanWorktree> {
+        let repos = db::get_repos(&self.conn);
+        let tracked_paths: HashSet<String> = db::get_worktrees(&self.conn)
+            .into_iter()
+            .map(|wt| wt.path)
+            .collect();
+        let mut git_results: HashMap<i64, Vec<GitWorktree>> = HashMap::new();
+        for repo in &repos {
+            let Some(repo_id) = repo.id else { continue };
+            let entries = match git::list_worktrees(&repo.path) {
+                Ok(es) => es,
+                Err(_) => continue, // skip repos whose git invocation fails
+            };
+            // IO-side filter: drop entries whose directory no longer exists on
+            // disk. `git worktree list` reports them until `git worktree prune`
+            // runs.
+            let live: Vec<GitWorktree> = entries
+                .into_iter()
+                .filter(|e| Path::new(&e.path).is_dir())
+                .collect();
+            git_results.insert(repo_id, live);
+        }
+        filter_orphans(&repos, &tracked_paths, &git_results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::GitWorktree;
+
+    fn make_repo(id: i64, name: &str, path: &str) -> Repo {
+        Repo {
+            id: Some(id),
+            path: path.to_string(),
+            name: name.to_string(),
+            default_branch: "main".to_string(),
+        }
+    }
+
+    fn make_gw(path: &str, branch: Option<&str>) -> GitWorktree {
+        GitWorktree {
+            path: path.to_string(),
+            branch: branch.map(|b| b.to_string()),
+            commit: None,
+        }
+    }
+
+    #[test]
+    fn filter_orphans_excludes_main_worktree() {
+        let repo = make_repo(1, "trellis", "/dev/trellis");
+        let mut git_results = HashMap::new();
+        git_results.insert(1, vec![make_gw("/dev/trellis", Some("main"))]);
+        let result = filter_orphans(&[repo], &HashSet::new(), &git_results);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_orphans_excludes_tracked_paths() {
+        let repo = make_repo(1, "trellis", "/dev/trellis");
+        let mut git_results = HashMap::new();
+        git_results.insert(1, vec![make_gw("/wt/trellis/feat-a", Some("feat-a"))]);
+        let mut tracked = HashSet::new();
+        tracked.insert("/wt/trellis/feat-a".to_string());
+        let result = filter_orphans(&[repo], &tracked, &git_results);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_orphans_excludes_detached_head() {
+        let repo = make_repo(1, "trellis", "/dev/trellis");
+        let mut git_results = HashMap::new();
+        git_results.insert(1, vec![make_gw("/wt/trellis/probe", Some("(detached)"))]);
+        let result = filter_orphans(&[repo], &HashSet::new(), &git_results);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_orphans_excludes_missing_branch_defensively() {
+        let repo = make_repo(1, "trellis", "/dev/trellis");
+        let mut git_results = HashMap::new();
+        git_results.insert(1, vec![make_gw("/wt/trellis/x", None)]);
+        let result = filter_orphans(&[repo], &HashSet::new(), &git_results);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_orphans_includes_untracked_branch() {
+        let repo = make_repo(1, "trellis", "/dev/trellis");
+        let mut git_results = HashMap::new();
+        git_results.insert(
+            1,
+            vec![
+                make_gw("/dev/trellis", Some("main")),
+                make_gw("/wt/trellis/feat-a", Some("feat-a")),
+            ],
+        );
+        let result = filter_orphans(&[repo], &HashSet::new(), &git_results);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].branch, "feat-a");
+        assert_eq!(result[0].path, "/wt/trellis/feat-a");
+        assert_eq!(result[0].repo.name, "trellis");
+    }
+
+    #[test]
+    fn filter_orphans_sorts_by_repo_then_branch() {
+        let r1 = make_repo(1, "alpha", "/dev/alpha");
+        let r2 = make_repo(2, "beta", "/dev/beta");
+        let mut git_results = HashMap::new();
+        git_results.insert(
+            1,
+            vec![
+                make_gw("/wt/alpha/zeta", Some("zeta")),
+                make_gw("/wt/alpha/aaa", Some("aaa")),
+            ],
+        );
+        git_results.insert(2, vec![make_gw("/wt/beta/mid", Some("mid"))]);
+        let result = filter_orphans(&[r1, r2], &HashSet::new(), &git_results);
+        let names: Vec<(String, String)> = result
+            .iter()
+            .map(|o| (o.repo.name.clone(), o.branch.clone()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("alpha".to_string(), "aaa".to_string()),
+                ("alpha".to_string(), "zeta".to_string()),
+                ("beta".to_string(), "mid".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_orphans_skips_repos_without_git_results() {
+        let repo = make_repo(1, "trellis", "/dev/trellis");
+        let git_results: HashMap<i64, Vec<GitWorktree>> = HashMap::new();
+        let result = filter_orphans(&[repo], &HashSet::new(), &git_results);
+        assert!(result.is_empty());
     }
 }
