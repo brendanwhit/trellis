@@ -169,6 +169,41 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), GitEr
     Ok(())
 }
 
+pub fn prune_worktrees(repo_path: &str) -> Result<(), GitError> {
+    let output = run(&["worktree", "prune"], Some(repo_path));
+    if !output.status.success() {
+        return Err(GitError(format!(
+            "Failed to prune worktrees in '{}': {}",
+            repo_path,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Attach a worktree to a branch that already exists locally.
+/// Unlike `create_worktree`, this does not use `-b`, so it does not require
+/// the branch to be new.
+pub fn add_worktree_existing_branch(
+    repo_path: &str,
+    worktree_path: &str,
+    branch: &str,
+) -> Result<(), GitError> {
+    let output = run(
+        &["worktree", "add", worktree_path, branch],
+        Some(repo_path),
+    );
+    if !output.status.success() {
+        return Err(GitError(format!(
+            "Failed to attach worktree at '{}' to branch '{}': {}",
+            worktree_path,
+            branch,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 pub fn get_pr_branch(repo_path: &str, pr_number: i64) -> Result<String, GitError> {
     let pr_str = pr_number.to_string();
     let output = Command::new("gh")
@@ -239,4 +274,62 @@ pub fn has_remote_branch(repo_path: &str, branch: &str) -> Result<bool, GitError
         )));
     }
     Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+
+    fn init_repo(dir: &std::path::Path) {
+        Command::new("git").args(["init", "-q"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["config", "user.name", "t"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["commit", "--allow-empty", "-qm", "init"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["branch", "-M", "main"]).current_dir(dir).output().unwrap();
+    }
+
+    #[test]
+    fn prune_removes_stale_worktree_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        // macOS tempdirs live under /var which is symlinked to /private/var.
+        // git resolves paths through the symlink, so canonicalize before comparing.
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        let wt = tmp.path().canonicalize().unwrap().join("wt");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        Command::new("git")
+            .args(["worktree", "add", "-b", "feat", wt.to_str().unwrap(), "main"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        fs::remove_dir_all(&wt).unwrap();
+
+        let before = list_worktrees(repo.to_str().unwrap()).unwrap();
+        assert!(before.iter().any(|w| w.path == wt.to_string_lossy()));
+
+        prune_worktrees(repo.to_str().unwrap()).unwrap();
+
+        let after = list_worktrees(repo.to_str().unwrap()).unwrap();
+        assert!(!after.iter().any(|w| w.path == wt.to_string_lossy()));
+    }
+
+    #[test]
+    fn add_worktree_existing_branch_attaches_without_creating_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        // Create branch separately, then attach a worktree without -b.
+        Command::new("git").args(["branch", "feat-existing"]).current_dir(&repo).output().unwrap();
+        let wt = tmp.path().canonicalize().unwrap().join("wt");
+
+        add_worktree_existing_branch(repo.to_str().unwrap(), wt.to_str().unwrap(), "feat-existing").unwrap();
+
+        let listed = list_worktrees(repo.to_str().unwrap()).unwrap();
+        assert!(listed.iter().any(|w| w.branch.as_deref() == Some("feat-existing")));
+    }
 }
