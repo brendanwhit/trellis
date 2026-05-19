@@ -20,26 +20,30 @@ const DEFAULT_LAYOUT: &[(&str, Option<&str>)] = &[
 ];
 
 /// Create a tmux session and set up windows according to the default layout.
+///
+/// The first layout entry becomes the session's initial window — named at
+/// `tmux new-session` time via `-n`, so we don't depend on tmux's
+/// configurable `base-index`. Subsequent entries become additional windows.
 pub fn apply_layout(session_name: &str, working_dir: &str) {
-    // Create the session
-    if let Err(_) = tmux::new_session(session_name, working_dir) {
+    let (first_name, first_command) = DEFAULT_LAYOUT[0];
+    if let Err(_) = tmux::new_session(session_name, working_dir, Some(first_name)) {
         return;
     }
+    if let Some(cmd) = first_command {
+        let target = format!("{}:{}", session_name, first_name);
+        tmux::send_keys(&target, &[cmd, "Enter"]);
+    }
 
-    for (i, &(name, command)) in DEFAULT_LAYOUT.iter().enumerate() {
-        if i == 0 {
-            let _ = tmux::rename_window(session_name, 1, name);
-        } else {
-            let _ = tmux::new_window(session_name, name, Some(working_dir));
-        }
+    for &(name, command) in &DEFAULT_LAYOUT[1..] {
+        let _ = tmux::new_window(session_name, name, Some(working_dir));
         if let Some(cmd) = command {
             let target = format!("{}:{}", session_name, name);
             tmux::send_keys(&target, &[cmd, "Enter"]);
         }
     }
 
-    // Focus the first window
-    let _ = tmux::select_window(session_name, 1);
+    // Focus the first window by name (base-index agnostic).
+    let _ = tmux::select_window_by_name(session_name, first_name);
 }
 
 /// Find or create the on-disk worktree for (repo, branch).
@@ -1072,6 +1076,25 @@ mod tests {
     }
 
     #[test]
+    fn apply_layout_creates_named_windows_independent_of_base_index() {
+        // The bug we're fixing: hardcoded window index 1 in rename_window
+        // silently failed on default tmux (base-index 0), leaving the first
+        // window with tmux's default name ("zsh") instead of "claude".
+        // The fix passes -n claude at new-session time, so the first window
+        // is correctly named regardless of base-index.
+        let tmp = tempdir().unwrap();
+        let session_name = format!("trellistest-layout-{}", std::process::id());
+        let _guard = SessionGuard(session_name.clone());
+
+        apply_layout(&session_name, &tmp.path().to_string_lossy());
+        assert!(crate::tmux::session_exists(&session_name));
+
+        let windows = crate::tmux::list_windows(&session_name);
+        let names: Vec<String> = windows.iter().map(|w| w.name.clone()).collect();
+        assert_eq!(names, vec!["claude".to_string(), "shell".to_string()]);
+    }
+
+    #[test]
     fn resurrect_session_uses_orphan_worktree_by_branch() {
         // The scenario the user hit on 2026-05-19: scan_existing recorded a
         // worktree on disk but left session_id NULL. After reboot, the DB has
@@ -1134,7 +1157,7 @@ mod tests {
         let _guard = SessionGuard(session_name.clone());
 
         // Pre-create the tmux session so resurrect_session sees a live one.
-        crate::tmux::new_session(&session_name, &repo_path).unwrap();
+        crate::tmux::new_session(&session_name, &repo_path, None).unwrap();
         assert!(crate::tmux::session_exists(&session_name));
 
         let inserted = crate::db::add_session(&mgr.conn, &crate::models::Session {

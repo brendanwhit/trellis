@@ -73,11 +73,15 @@ pub fn session_exists(name: &str) -> bool {
     run(&["has-session", "-t", name]).status.success()
 }
 
-pub fn new_session(name: &str, start_dir: &str) -> Result<(), TmuxError> {
+pub fn new_session(name: &str, start_dir: &str, initial_window: Option<&str>) -> Result<(), TmuxError> {
     if session_exists(name) {
         return Err(TmuxError(format!("Session '{}' already exists", name)));
     }
-    let output = run(&["new-session", "-d", "-s", name, "-c", start_dir]);
+    let mut args = vec!["new-session", "-d", "-s", name, "-c", start_dir];
+    if let Some(window_name) = initial_window {
+        args.extend_from_slice(&["-n", window_name]);
+    }
+    let output = run(&args);
     if !output.status.success() {
         return Err(TmuxError(format!(
             "Failed to create session '{}': {}",
@@ -139,6 +143,22 @@ pub fn select_window(session: &str, index: i64) -> Result<(), TmuxError> {
         return Err(TmuxError(format!(
             "Failed to select window {} in '{}': {}",
             index,
+            session,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Select a window by its name rather than index — robust to tmux's
+/// configurable `base-index` (default 0, but commonly set to 1).
+pub fn select_window_by_name(session: &str, name: &str) -> Result<(), TmuxError> {
+    let target = format!("{}:{}", session, name);
+    let output = run(&["select-window", "-t", &target]);
+    if !output.status.success() {
+        return Err(TmuxError(format!(
+            "Failed to select window '{}' in '{}': {}",
+            name,
             session,
             String::from_utf8_lossy(&output.stderr).trim()
         )));

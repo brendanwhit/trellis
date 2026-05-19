@@ -285,7 +285,7 @@ impl HistoryScreen {
         } else {
             // Create new tmux session
             let session_name = format!("resume-{}", &session_id[..session_id.len().min(8)]);
-            let _ = tmux::new_session(&session_name, &entry.project);
+            let _ = tmux::new_session(&session_name, &entry.project, None);
             tmux::send_keys(&session_name, &[&resume_cmd, "Enter"]);
             switch::write_switch(&SwitchAction::Session {
                 target: session_name,
