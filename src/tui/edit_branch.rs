@@ -85,15 +85,16 @@ impl EditBranchScreen {
     }
 
     fn rebuild_display(&mut self) {
-        let query = self.filter.to_lowercase();
-        let filtered: Vec<String> = if query.is_empty() {
+        let filtered: Vec<String> = if self.filter.is_empty() {
             self.all_branches.clone()
         } else {
-            self.all_branches
+            let mut scored: Vec<(String, i32)> = self
+                .all_branches
                 .iter()
-                .filter(|b| b.to_lowercase().contains(&query))
-                .cloned()
-                .collect()
+                .filter_map(|b| crate::fuzzy::fuzzy_match(&self.filter, b).map(|s| (b.clone(), s)))
+                .collect();
+            scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+            scored.into_iter().map(|(b, _)| b).collect()
         };
 
         self.display = filtered
