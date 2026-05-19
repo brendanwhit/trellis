@@ -171,6 +171,52 @@ impl Manager {
         )
     }
 
+    fn find_or_create_session(&self, repo: &Repo, branch: &str, wt_path: &str) -> Result<Session, String> {
+        let session_name = tmux::sanitize_session_name(branch);
+
+        // Existing DB row?
+        if let Some(existing) = self.get_session_by_name(&session_name) {
+            if existing.repo_id == repo.id.unwrap() && tmux::session_exists(&session_name) {
+                return Ok(existing);
+            }
+            // Stale row — drop it.
+            if let Some(id) = existing.id {
+                db::delete_session(&self.conn, id);
+            }
+        }
+
+        // Create fresh: DB row, tmux session via apply_layout, optional worktree DB row.
+        let session = db::add_session(
+            &self.conn,
+            &Session {
+                id: None,
+                name: session_name.clone(),
+                repo_id: repo.id.unwrap(),
+                base_branch: branch.to_string(),
+                created_at: utc_now(),
+                last_selected_at: None,
+            },
+        );
+        apply_layout(&session_name, wt_path);
+
+        if wt_path != repo.path && db::get_worktree_by_path(&self.conn, wt_path).is_none() {
+            db::add_worktree(
+                &self.conn,
+                &Worktree {
+                    id: None,
+                    repo_id: repo.id.unwrap(),
+                    path: wt_path.to_string(),
+                    branch: branch.to_string(),
+                    session_id: session.id,
+                    tmux_window: None,
+                    created_at: utc_now(),
+                },
+            );
+        }
+
+        Ok(session)
+    }
+
     // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
@@ -929,5 +975,79 @@ mod tests {
         // Now ask trellis to find/create for feat-y — should return the unusual path.
         let found = resolve_or_create_worktree(&repo, "myrepo", "feat-y", &wts, "main").unwrap();
         assert_eq!(found, unusual.to_string_lossy().to_string());
+    }
+
+    // ------------------------------------------------------------------
+    // find_or_create_session tests
+    // ------------------------------------------------------------------
+
+    fn make_manager() -> Manager {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_schema(&conn);
+        Manager::new(conn)
+    }
+
+    /// Cleans up a tmux session at end of test (even on panic).
+    struct SessionGuard(String);
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            let _ = crate::tmux::kill_session(&self.0);
+        }
+    }
+
+    /// Process-unique branch name. tmux::sanitize_session_name leaves `-` and
+    /// alphanumerics alone, so the sanitized version is identical.
+    fn unique_branch(suffix: &str) -> String {
+        format!("trellistest-{}-{}", std::process::id(), suffix)
+    }
+
+    #[test]
+    fn find_or_create_session_inserts_when_missing() {
+        let tmp = tempdir().unwrap();
+        let (repo_path, _) = make_repo(tmp.path());
+        let mgr = make_manager();
+
+        let repo = mgr.get_or_create_repo(&repo_path);
+        let branch = unique_branch("fresh");
+        let _guard = SessionGuard(crate::tmux::sanitize_session_name(&branch));
+        let wt_path = tmp.path().join("wt").to_string_lossy().to_string();
+
+        let session = mgr.find_or_create_session(&repo, &branch, &wt_path).unwrap();
+        assert_eq!(session.base_branch, branch);
+        assert!(crate::db::get_session_by_name(&mgr.conn, &session.name).is_some());
+    }
+
+    #[test]
+    fn find_or_create_session_drops_stale_db_row_then_inserts() {
+        let tmp = tempdir().unwrap();
+        let (repo_path, _) = make_repo(tmp.path());
+        let mgr = make_manager();
+
+        let repo = mgr.get_or_create_repo(&repo_path);
+        let branch = unique_branch("stale");
+        let session_name = crate::tmux::sanitize_session_name(&branch);
+        let _guard = SessionGuard(session_name.clone());
+
+        // Pre-insert a "stale" DB row. The corresponding tmux session does not
+        // exist yet (unique name + Drop cleanup guarantees this across runs).
+        crate::db::add_session(&mgr.conn, &crate::models::Session {
+            id: None,
+            name: session_name.clone(),
+            repo_id: repo.id.unwrap(),
+            base_branch: branch.clone(),
+            created_at: crate::utils::utc_now(),
+            last_selected_at: None,
+        });
+        assert!(crate::db::get_session_by_name(&mgr.conn, &session_name).is_some());
+        assert!(!crate::tmux::session_exists(&session_name));
+
+        let wt_path = tmp.path().join("wt").to_string_lossy().to_string();
+        let fresh = mgr.find_or_create_session(&repo, &branch, &wt_path).unwrap();
+        assert_eq!(fresh.name, session_name);
+        let rows: Vec<_> = crate::db::get_sessions(&mgr.conn)
+            .into_iter()
+            .filter(|s| s.name == session_name)
+            .collect();
+        assert_eq!(rows.len(), 1);
     }
 }

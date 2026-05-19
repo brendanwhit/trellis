@@ -8,6 +8,37 @@ pub fn init_db(db_path: &Path) -> Connection {
         std::fs::create_dir_all(parent).ok();
     }
     let conn = Connection::open(db_path).expect("open database");
+    init_schema(&conn);
+
+    // Seed defaults (env-dependent, so kept out of init_schema).
+    conn.execute(
+        "INSERT OR IGNORE INTO config (key, value) VALUES (?1, ?2)",
+        params![
+            "repos_dir",
+            dirs::home_dir().unwrap().join("dev").to_str().unwrap()
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO config (key, value) VALUES (?1, ?2)",
+        params![
+            "worktrees_dir",
+            dirs::home_dir()
+                .unwrap()
+                .join("dev/worktrees")
+                .to_str()
+                .unwrap()
+        ],
+    )
+    .unwrap();
+
+    conn
+}
+
+/// Apply schema (tables + migrations) to an open connection.
+/// Separated from `init_db` so tests can build an in-memory connection
+/// with the full schema without depending on `dirs::home_dir()`.
+pub fn init_schema(conn: &Connection) {
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
     conn.execute_batch(
@@ -43,28 +74,6 @@ pub fn init_db(db_path: &Path) -> Connection {
     )
     .unwrap();
 
-    // Seed defaults
-    conn.execute(
-        "INSERT OR IGNORE INTO config (key, value) VALUES (?1, ?2)",
-        params![
-            "repos_dir",
-            dirs::home_dir().unwrap().join("dev").to_str().unwrap()
-        ],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT OR IGNORE INTO config (key, value) VALUES (?1, ?2)",
-        params![
-            "worktrees_dir",
-            dirs::home_dir()
-                .unwrap()
-                .join("dev/worktrees")
-                .to_str()
-                .unwrap()
-        ],
-    )
-    .unwrap();
-
     // Migration: add last_selected_at column if missing
     let has_col: bool = conn
         .prepare("PRAGMA table_info(sessions)")
@@ -76,8 +85,6 @@ pub fn init_db(db_path: &Path) -> Connection {
         conn.execute_batch("ALTER TABLE sessions ADD COLUMN last_selected_at TEXT;")
             .unwrap();
     }
-
-    conn
 }
 
 // --- Config ---
