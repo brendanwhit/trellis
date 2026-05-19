@@ -270,7 +270,9 @@ impl Manager {
     // Public API
     // ------------------------------------------------------------------
 
-    /// Register repo if needed, create worktree, create DB session, create tmux session.
+    /// Register repo if needed, create or reuse worktree, create or reuse DB
+    /// session, create tmux session. If a live session for (repo, base_branch)
+    /// already exists, routes to it (user-typed `session_name` ignored).
     pub fn create_session(
         &self,
         repo_path: &str,
@@ -280,54 +282,66 @@ impl Manager {
     ) -> Result<Session, String> {
         let repo = self.get_or_create_repo(repo_path);
 
-        let default = &repo.default_branch;
-        let start_dir = if base_branch == default {
-            repo_path.to_string()
-        } else {
-            // Fetch latest before creating worktree (non-fatal — stale state is acceptable)
-            let _ = git::fetch_and_pull(repo_path, default);
-
-            let wt_path = self.worktree_path(&repo.name, base_branch);
-            match git::create_worktree(repo_path, &wt_path, base_branch, default) {
-                Ok(()) => {}
-                Err(e) => {
-                    // Branch/worktree may already exist - use it if the dir is there
-                    if !Path::new(&wt_path).exists() {
-                        return Err(format!("Worktree creation failed: {}", e));
-                    }
-                }
+        // Spec: "n on branch X when X already has a session — route to the
+        // existing session." Consult by branch BEFORE honoring the user-typed
+        // name. The wizard's auto_session_name disambiguates to "feat-x-2",
+        // "feat-x-3", etc. when a session for the branch exists; bypass that.
+        let by_branch: Vec<Session> = db::get_sessions(&self.conn)
+            .into_iter()
+            .filter(|s| s.repo_id == repo.id.unwrap() && s.base_branch == base_branch)
+            .collect();
+        for s in by_branch {
+            if tmux::session_exists(&s.name) {
+                return Ok(s);
             }
-            wt_path
+            // Dead tmux session — drop stale row and continue.
+            if let Some(id) = s.id {
+                db::delete_session(&self.conn, id);
+            }
+        }
+
+        // No live session for this branch. Resolve the worktree.
+        let wt_path = if base_branch == repo.default_branch {
+            repo.path.clone()
+        } else {
+            // Fetch latest before resolving worktree (non-fatal — stale is acceptable).
+            let _ = git::fetch_and_pull(repo_path, &repo.default_branch);
+            // New branches root at the repo's default branch.
+            self.find_or_create_worktree(&repo, base_branch, &repo.default_branch)?
+        };
+
+        // Honor the user-typed session name (or fall back to sanitized branch).
+        let chosen_name = if session_name.is_empty() {
+            tmux::sanitize_session_name(base_branch)
+        } else {
+            tmux::sanitize_session_name(session_name)
+        };
+
+        let effective_dir = match subdirectory {
+            Some(sub) => Path::new(&wt_path).join(sub).to_string_lossy().to_string(),
+            None => wt_path.clone(),
         };
 
         let session = db::add_session(
             &self.conn,
             &Session {
                 id: None,
-                name: session_name.to_string(),
+                name: chosen_name.clone(),
                 repo_id: repo.id.unwrap(),
                 base_branch: base_branch.to_string(),
                 created_at: utc_now(),
                 last_selected_at: None,
             },
         );
+        apply_layout(&chosen_name, &effective_dir);
 
-        let effective_dir = if let Some(sub) = subdirectory {
-            Path::new(&start_dir).join(sub).to_string_lossy().to_string()
-        } else {
-            start_dir.clone()
-        };
-
-        apply_layout(session_name, &effective_dir);
-
-        // Record worktree if we created one
-        if start_dir != repo_path {
+        if wt_path != repo.path && db::get_worktree_by_path(&self.conn, &wt_path).is_none() {
             db::add_worktree(
                 &self.conn,
                 &Worktree {
                     id: None,
                     repo_id: repo.id.unwrap(),
-                    path: start_dir,
+                    path: wt_path.clone(),
                     branch: base_branch.to_string(),
                     session_id: session.id,
                     tmux_window: None,
