@@ -42,6 +42,60 @@ pub fn apply_layout(session_name: &str, working_dir: &str) {
     let _ = tmux::select_window(session_name, 1);
 }
 
+/// Find or create the on-disk worktree for (repo, branch).
+///
+/// Git's `worktree list` is the source of truth. If a worktree for `branch`
+/// already exists, returns its recorded path (even if outside `worktrees_dir`).
+/// If git considers a worktree prunable (dir gone), prunes and reattaches the
+/// worktree to the still-existing branch. Otherwise creates fresh at the
+/// trellis-convention path, branching from `start_point`.
+///
+/// `start_point` is only consulted when creating a NEW local branch. Callers
+/// pass what they want the branch rooted at (e.g. `repo.default_branch`,
+/// `session.base_branch`, or `format!("origin/{}", branch)` for PR review).
+pub fn resolve_or_create_worktree(
+    repo_path: &str,
+    repo_name: &str,
+    branch: &str,
+    worktrees_dir: &str,
+    start_point: &str,
+) -> Result<String, String> {
+    let mut needs_prune = false;
+    let existing = git::list_worktrees(repo_path).map_err(|e| e.to_string())?;
+    for wt in &existing {
+        if wt.branch.as_deref() == Some(branch) {
+            if !Path::new(&wt.path).exists() {
+                needs_prune = true;
+                break;
+            }
+            return Ok(wt.path.clone());
+        }
+    }
+
+    if needs_prune {
+        let _ = git::prune_worktrees(repo_path);
+    }
+
+    let wt_path = Path::new(worktrees_dir)
+        .join(repo_name)
+        .join(branch.replace('/', "-"))
+        .to_string_lossy()
+        .to_string();
+
+    // Pick between `git worktree add -b <branch> <path> <start>` (new branch)
+    // and `git worktree add <path> <branch>` (existing branch). After a prune,
+    // the local branch ref still exists, so the existing-branch path is taken.
+    let branches = git::list_branches(repo_path).map_err(|e| e.to_string())?;
+    if branches.iter().any(|b| b == branch) {
+        git::add_worktree_existing_branch(repo_path, &wt_path, branch)
+            .map_err(|e| format!("Failed to attach worktree: {}", e))?;
+    } else {
+        git::create_worktree(repo_path, &wt_path, branch, start_point)
+            .map_err(|e| format!("Failed to create worktree: {}", e))?;
+    }
+    Ok(wt_path)
+}
+
 /// Detect subsystem directories in a monorepo (e.g. workers/model_train, src/sojourner).
 pub fn detect_subsystems(repo_path: &str) -> Vec<String> {
     let root = Path::new(repo_path);
@@ -100,6 +154,21 @@ impl Manager {
             .join(branch.replace("/", "-"))
             .to_string_lossy()
             .to_string()
+    }
+
+    fn find_or_create_worktree(
+        &self,
+        repo: &Repo,
+        branch: &str,
+        start_point: &str,
+    ) -> Result<String, String> {
+        resolve_or_create_worktree(
+            &repo.path,
+            &repo.name,
+            branch,
+            &self.worktrees_dir().to_string_lossy(),
+            start_point,
+        )
     }
 
     // ------------------------------------------------------------------
@@ -789,5 +858,76 @@ impl Manager {
 
     pub fn get_all_worktrees(&self) -> Vec<Worktree> {
         db::get_worktrees(&self.conn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn init_repo(dir: &Path) {
+        Command::new("git").args(["init", "-q"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["config", "user.name", "t"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["commit", "--allow-empty", "-qm", "init"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["branch", "-M", "main"]).current_dir(dir).output().unwrap();
+    }
+
+    fn make_repo(tmp: &Path) -> (String, String) {
+        let canonical = tmp.canonicalize().unwrap();
+        let repo = canonical.join("repo");
+        let worktrees = canonical.join("worktrees");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&worktrees).unwrap();
+        init_repo(&repo);
+        (repo.to_string_lossy().to_string(), worktrees.to_string_lossy().to_string())
+    }
+
+    #[test]
+    fn resolve_creates_when_no_existing_worktree() {
+        let tmp = tempdir().unwrap();
+        let (repo, wts) = make_repo(tmp.path());
+        let path = resolve_or_create_worktree(&repo, "myrepo", "feat/x", &wts, "main").unwrap();
+        assert!(Path::new(&path).exists());
+        assert!(path.ends_with("feat-x"));
+    }
+
+    #[test]
+    fn resolve_reuses_existing_worktree() {
+        let tmp = tempdir().unwrap();
+        let (repo, wts) = make_repo(tmp.path());
+        let first = resolve_or_create_worktree(&repo, "myrepo", "feat/x", &wts, "main").unwrap();
+        let second = resolve_or_create_worktree(&repo, "myrepo", "feat/x", &wts, "main").unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn resolve_recovers_from_prunable_worktree() {
+        let tmp = tempdir().unwrap();
+        let (repo, wts) = make_repo(tmp.path());
+        let first = resolve_or_create_worktree(&repo, "myrepo", "feat/x", &wts, "main").unwrap();
+        // Nuke the dir behind git's back to make it prunable.
+        fs::remove_dir_all(&first).unwrap();
+        let second = resolve_or_create_worktree(&repo, "myrepo", "feat/x", &wts, "main").unwrap();
+        assert!(Path::new(&second).exists());
+    }
+
+    #[test]
+    fn resolve_finds_worktree_at_nonconventional_path() {
+        let tmp = tempdir().unwrap();
+        let (repo, wts) = make_repo(tmp.path());
+        // User created a worktree at an unusual path outside our convention.
+        let unusual = tmp.path().canonicalize().unwrap().join("unusual-spot");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "feat-y", unusual.to_str().unwrap(), "main"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        // Now ask trellis to find/create for feat-y — should return the unusual path.
+        let found = resolve_or_create_worktree(&repo, "myrepo", "feat-y", &wts, "main").unwrap();
+        assert_eq!(found, unusual.to_string_lossy().to_string());
     }
 }
