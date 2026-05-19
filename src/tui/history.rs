@@ -103,7 +103,7 @@ impl HistoryScreen {
                     let candidates: [&str; 4] = [&e.date, &e.project, &e.branch, e.summary()];
                     let best = candidates
                         .iter()
-                        .filter_map(|c| crate::fuzzy::fuzzy_match(q, c))
+                        .filter_map(|c| crate::fuzzy::fuzzy_match_multi(q, c))
                         .min();
                     best.map(|score| (e.clone(), score))
                 })

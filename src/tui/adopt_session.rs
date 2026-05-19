@@ -171,7 +171,7 @@ impl AdoptSessionScreen {
                     .filter_map(|(i, r)| {
                         let best = [r.name.as_str(), r.path.as_str()]
                             .iter()
-                            .filter_map(|c| crate::fuzzy::fuzzy_match(&query, c))
+                            .filter_map(|c| crate::fuzzy::fuzzy_match_multi(&query, c))
                             .min();
                         best.map(|score| (i, score))
                     })
@@ -191,7 +191,7 @@ impl AdoptSessionScreen {
                 let mut scored: Vec<(String, i32)> = self
                     .branches
                     .iter()
-                    .filter_map(|b| crate::fuzzy::fuzzy_match(&query, b).map(|s| (b.clone(), s)))
+                    .filter_map(|b| crate::fuzzy::fuzzy_match_multi(&query, b).map(|s| (b.clone(), s)))
                     .collect();
                 scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
                 self.filtered_branches = scored.into_iter().map(|(b, _)| b).collect();

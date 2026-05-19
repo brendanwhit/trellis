@@ -274,7 +274,7 @@ impl NewSessionScreen {
                     .filter_map(|(n, p)| {
                         let best = [n.as_str(), p.as_str()]
                             .iter()
-                            .filter_map(|c| crate::fuzzy::fuzzy_match(&query, c))
+                            .filter_map(|c| crate::fuzzy::fuzzy_match_multi(&query, c))
                             .min();
                         best.map(|score| ((n.clone(), p.clone()), score))
                     })
@@ -292,7 +292,7 @@ impl NewSessionScreen {
                 let mut scored: Vec<(String, i32)> = self
                     .branches
                     .iter()
-                    .filter_map(|b| crate::fuzzy::fuzzy_match(&query, b).map(|s| (b.clone(), s)))
+                    .filter_map(|b| crate::fuzzy::fuzzy_match_multi(&query, b).map(|s| (b.clone(), s)))
                     .collect();
                 scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
                 self.filtered_branches = scored.into_iter().map(|(b, _)| b).collect();
@@ -305,7 +305,7 @@ impl NewSessionScreen {
                 let mut scored: Vec<(String, i32)> = self
                     .subsystems
                     .iter()
-                    .filter_map(|s| crate::fuzzy::fuzzy_match(&query, s).map(|sc| (s.clone(), sc)))
+                    .filter_map(|s| crate::fuzzy::fuzzy_match_multi(&query, s).map(|sc| (s.clone(), sc)))
                     .collect();
                 scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
                 self.filtered_subsystems = scored.into_iter().map(|(s, _)| s).collect();
@@ -669,13 +669,13 @@ impl ScreenBehavior for NewSessionScreen {
 
 #[cfg(test)]
 mod tests {
-    use crate::fuzzy::fuzzy_match;
+    use crate::fuzzy::fuzzy_match_multi;
 
     /// Helper that mirrors what the picker's filter does post-change.
     fn rank(query: &str, items: &[&str]) -> Vec<String> {
         let mut scored: Vec<(String, i32)> = items
             .iter()
-            .filter_map(|s| fuzzy_match(query, s).map(|score| (s.to_string(), score)))
+            .filter_map(|s| fuzzy_match_multi(query, s).map(|score| (s.to_string(), score)))
             .collect();
         scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
         scored.into_iter().map(|(s, _)| s).collect()

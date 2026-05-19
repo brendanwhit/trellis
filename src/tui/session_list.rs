@@ -8,7 +8,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
 
 use crate::claude_pane;
-use crate::fuzzy::fuzzy_match;
+use crate::fuzzy::fuzzy_match_multi;
 use crate::manager::Manager;
 use crate::models::{Repo, SessionInfo};
 use crate::switch::SwitchAction;
@@ -240,7 +240,7 @@ impl SessionListScreen {
                 ];
                 let mut best: Option<i32> = None;
                 for c in &candidates {
-                    if let Some(s) = fuzzy_match(&self.filter, c) {
+                    if let Some(s) = fuzzy_match_multi(&self.filter, c) {
                         if best.is_none() || s < best.unwrap() {
                             best = Some(s);
                         }
