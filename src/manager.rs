@@ -164,9 +164,18 @@ impl Manager {
     }
 
     /// If the tmux session for `session_id` is dead (DB row exists but
-    /// `tmux has-session` is false), recreate it using the worktree path
-    /// recorded in the DB (falling back to the repo root for default-branch
-    /// sessions). No-op if the session is already alive.
+    /// `tmux has-session` is false), recreate it at the right working
+    /// directory. No-op if the session is already alive.
+    ///
+    /// Working directory is resolved in this order:
+    ///   1. A DB worktree row linked to this session via `session_id`
+    ///   2. A DB worktree row matching `(repo_id, base_branch)` even if
+    ///      `session_id` is `NULL` (e.g. scan_existing recorded the worktree
+    ///      on disk but never linked it because no live tmux session existed
+    ///      at scan time — the common case after reboot)
+    ///   3. Git's authoritative `worktree list` for this repo, matching by
+    ///      branch (covers worktrees created outside trellis)
+    ///   4. The repo root (only correct for default-branch sessions)
     pub fn resurrect_session(&self, session_id: i64) -> Result<(), String> {
         let session = self
             .get_session_by_id(session_id)
@@ -176,12 +185,28 @@ impl Manager {
             return Ok(());
         }
 
+        let repo = self
+            .get_repo_by_id(session.repo_id)
+            .ok_or_else(|| format!("repo {} not found", session.repo_id))?;
+
         let wt_path = db::get_worktrees_for_session(&self.conn, session_id)
             .into_iter()
             .next()
             .map(|wt| wt.path)
-            .or_else(|| self.get_repo_by_id(session.repo_id).map(|r| r.path))
-            .ok_or_else(|| format!("no worktree or repo for session {}", session_id))?;
+            .or_else(|| {
+                db::get_worktrees(&self.conn)
+                    .into_iter()
+                    .find(|wt| wt.repo_id == session.repo_id && wt.branch == session.base_branch)
+                    .map(|wt| wt.path)
+            })
+            .or_else(|| {
+                git::list_worktrees(&repo.path).ok().and_then(|wts| {
+                    wts.into_iter()
+                        .find(|wt| wt.branch.as_deref() == Some(&session.base_branch))
+                        .map(|wt| wt.path)
+                })
+            })
+            .unwrap_or_else(|| repo.path.clone());
 
         if !Path::new(&wt_path).exists() {
             return Err(format!("path '{}' no longer exists", wt_path));
@@ -1044,6 +1069,57 @@ mod tests {
 
         mgr.resurrect_session(inserted.id.unwrap()).unwrap();
         assert!(crate::tmux::session_exists(&session_name));
+    }
+
+    #[test]
+    fn resurrect_session_uses_orphan_worktree_by_branch() {
+        // The scenario the user hit on 2026-05-19: scan_existing recorded a
+        // worktree on disk but left session_id NULL. After reboot, the DB has
+        // a session row + an orphan worktree row matching by (repo_id,
+        // base_branch). resurrect_session must find that worktree and use its
+        // path, not fall back to the repo root.
+        let tmp = tempdir().unwrap();
+        let (repo_path, _) = make_repo(tmp.path());
+        let mgr = make_manager();
+
+        let repo = mgr.get_or_create_repo(&repo_path);
+        let branch = unique_branch("orphan");
+        let session_name = crate::tmux::sanitize_session_name(&branch);
+        let _guard = SessionGuard(session_name.clone());
+
+        // A separate, real on-disk path for the worktree (not the repo root).
+        let worktree_dir = tmp.path().canonicalize().unwrap().join("wt-orphan");
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+        let wt_path_str = worktree_dir.to_string_lossy().to_string();
+
+        let inserted = crate::db::add_session(&mgr.conn, &crate::models::Session {
+            id: None,
+            name: session_name.clone(),
+            repo_id: repo.id.unwrap(),
+            base_branch: branch.clone(),
+            created_at: crate::utils::utc_now(),
+            last_selected_at: None,
+        });
+        crate::db::add_worktree(&mgr.conn, &crate::models::Worktree {
+            id: None,
+            repo_id: repo.id.unwrap(),
+            path: wt_path_str.clone(),
+            branch: branch.clone(),
+            session_id: None, // <- orphan: not linked to the session row above
+            tmux_window: None,
+            created_at: crate::utils::utc_now(),
+        });
+
+        mgr.resurrect_session(inserted.id.unwrap()).unwrap();
+        assert!(crate::tmux::session_exists(&session_name));
+
+        // Inspect tmux to confirm the working dir is the worktree, not the repo root.
+        let out = std::process::Command::new("tmux")
+            .args(["display-message", "-p", "-t", &session_name, "#{session_path}"])
+            .output()
+            .unwrap();
+        let session_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(session_path, wt_path_str);
     }
 
     #[test]
