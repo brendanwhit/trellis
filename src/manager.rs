@@ -492,7 +492,9 @@ impl Manager {
         Ok((session, wt_path))
     }
 
-    /// Create a worktree + tmux window for the given session.
+    /// Create or reuse a worktree + tmux window for the given session.
+    /// If a worktree for `branch_name` already exists, attaches a new tmux
+    /// window to it instead of erroring.
     pub fn add_tab(&self, session_id: i64, branch_name: &str) -> Result<Worktree, String> {
         let session = self
             .get_session_by_id(session_id)
@@ -502,23 +504,26 @@ impl Manager {
             .get_repo_by_id(session.repo_id)
             .ok_or_else(|| format!("Repo {} not found", session.repo_id))?;
 
-        let wt_path = self.worktree_path(&repo.name, branch_name);
-        git::create_worktree(&repo.path, &wt_path, branch_name, &session.base_branch)
-            .map_err(|e| format!("Failed to create worktree: {}", e))?;
+        // New branches in a tab root at the session's base branch (preserves existing behavior).
+        let wt_path = self.find_or_create_worktree(&repo, branch_name, &session.base_branch)?;
         let _ = tmux::new_window(&session.name, branch_name, Some(&wt_path));
 
-        let worktree = db::add_worktree(
-            &self.conn,
-            &Worktree {
-                id: None,
-                repo_id: repo.id.unwrap(),
-                path: wt_path,
-                branch: branch_name.to_string(),
-                session_id: Some(session_id),
-                tmux_window: None,
-                created_at: utc_now(),
-            },
-        );
+        let worktree = if let Some(existing) = db::get_worktree_by_path(&self.conn, &wt_path) {
+            existing
+        } else {
+            db::add_worktree(
+                &self.conn,
+                &Worktree {
+                    id: None,
+                    repo_id: repo.id.unwrap(),
+                    path: wt_path,
+                    branch: branch_name.to_string(),
+                    session_id: Some(session_id),
+                    tmux_window: None,
+                    created_at: utc_now(),
+                },
+            )
+        };
 
         Ok(worktree)
     }
