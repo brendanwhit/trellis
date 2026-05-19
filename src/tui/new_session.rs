@@ -265,39 +265,50 @@ impl NewSessionScreen {
     // ------------------------------------------------------------------
 
     fn apply_filter(&mut self) {
-        let query = self.filter_input.to_lowercase();
+        let query = self.filter_input.clone();
         match self.step {
             Step::PickRepo => {
-                self.filtered_dirs = self
+                let mut scored: Vec<((String, String), i32)> = self
                     .dev_dirs
                     .iter()
-                    .filter(|(n, p)| n.to_lowercase().contains(&query) || p.to_lowercase().contains(&query))
-                    .cloned()
+                    .filter_map(|(n, p)| {
+                        let best = [n.as_str(), p.as_str()]
+                            .iter()
+                            .filter_map(|c| crate::fuzzy::fuzzy_match(&query, c))
+                            .min();
+                        best.map(|score| ((n.clone(), p.clone()), score))
+                    })
                     .collect();
+                scored.sort_by(|a, b| {
+                    a.1.cmp(&b.1).then_with(|| a.0 .0.to_lowercase().cmp(&b.0 .0.to_lowercase()))
+                });
+                self.filtered_dirs = scored.into_iter().map(|((n, p), _)| (n, p)).collect();
                 self.repo_list_state = ListState::default();
                 if !self.filtered_dirs.is_empty() {
                     self.repo_list_state.select(Some(0));
                 }
             }
             Step::PickBranch => {
-                self.filtered_branches = self
+                let mut scored: Vec<(String, i32)> = self
                     .branches
                     .iter()
-                    .filter(|b| b.to_lowercase().contains(&query))
-                    .cloned()
+                    .filter_map(|b| crate::fuzzy::fuzzy_match(&query, b).map(|s| (b.clone(), s)))
                     .collect();
+                scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+                self.filtered_branches = scored.into_iter().map(|(b, _)| b).collect();
                 self.branch_list_state = ListState::default();
                 if !self.filtered_branches.is_empty() {
                     self.branch_list_state.select(Some(0));
                 }
             }
             Step::PickSubsystem => {
-                self.filtered_subsystems = self
+                let mut scored: Vec<(String, i32)> = self
                     .subsystems
                     .iter()
-                    .filter(|s| s.to_lowercase().contains(&query))
-                    .cloned()
+                    .filter_map(|s| crate::fuzzy::fuzzy_match(&query, s).map(|sc| (s.clone(), sc)))
                     .collect();
+                scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+                self.filtered_subsystems = scored.into_iter().map(|(s, _)| s).collect();
                 self.subsystem_list_state = ListState::default();
                 // Always have root at index 0
                 self.subsystem_list_state.select(Some(0));
@@ -653,5 +664,36 @@ impl ScreenBehavior for NewSessionScreen {
 
     fn is_modal(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::fuzzy::fuzzy_match;
+
+    /// Helper that mirrors what the picker's filter does post-change.
+    fn rank(query: &str, items: &[&str]) -> Vec<String> {
+        let mut scored: Vec<(String, i32)> = items
+            .iter()
+            .filter_map(|s| fuzzy_match(query, s).map(|score| (s.to_string(), score)))
+            .collect();
+        scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+        scored.into_iter().map(|(s, _)| s).collect()
+    }
+
+    #[test]
+    fn filter_ranks_subsequence_above_substring_only() {
+        let items = ["feat", "feature", "unrelated"];
+        let ranked = rank("ft", &items);
+        assert_eq!(ranked, vec!["feat".to_string(), "feature".to_string()]);
+    }
+
+    #[test]
+    fn filter_alphabetic_tiebreak_when_scores_equal() {
+        // Both candidates have the query char 'a' at position 0 -> identical
+        // score (0) from fuzzy_match -> alphabetical tiebreak picks "aaa" first.
+        let items = ["aaa", "abc"];
+        let ranked = rank("a", &items);
+        assert_eq!(ranked, vec!["aaa".to_string(), "abc".to_string()]);
     }
 }
