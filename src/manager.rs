@@ -163,6 +163,38 @@ impl Manager {
         )
     }
 
+    /// If the tmux session for `session_id` is dead (DB row exists but
+    /// `tmux has-session` is false), recreate it using the worktree path
+    /// recorded in the DB (falling back to the repo root for default-branch
+    /// sessions). No-op if the session is already alive.
+    pub fn resurrect_session(&self, session_id: i64) -> Result<(), String> {
+        let session = self
+            .get_session_by_id(session_id)
+            .ok_or_else(|| format!("session {} not found", session_id))?;
+
+        if tmux::session_exists(&session.name) {
+            return Ok(());
+        }
+
+        let wt_path = db::get_worktrees_for_session(&self.conn, session_id)
+            .into_iter()
+            .next()
+            .map(|wt| wt.path)
+            .or_else(|| self.get_repo_by_id(session.repo_id).map(|r| r.path))
+            .ok_or_else(|| format!("no worktree or repo for session {}", session_id))?;
+
+        if !Path::new(&wt_path).exists() {
+            return Err(format!("path '{}' no longer exists", wt_path));
+        }
+
+        apply_layout(&session.name, &wt_path);
+
+        if !tmux::session_exists(&session.name) {
+            return Err(format!("failed to create tmux session '{}'", session.name));
+        }
+        Ok(())
+    }
+
     fn find_or_create_session(&self, repo: &Repo, branch: &str, wt_path: &str) -> Result<Session, String> {
         let session_name = tmux::sanitize_session_name(branch);
 
@@ -977,6 +1009,105 @@ mod tests {
         let session = mgr.find_or_create_session(&repo, &branch, &wt_path).unwrap();
         assert_eq!(session.base_branch, branch);
         assert!(crate::db::get_session_by_name(&mgr.conn, &session.name).is_some());
+    }
+
+    #[test]
+    fn resurrect_session_creates_dead_tmux_session() {
+        let tmp = tempdir().unwrap();
+        let (repo_path, _) = make_repo(tmp.path());
+        let mgr = make_manager();
+
+        let repo = mgr.get_or_create_repo(&repo_path);
+        let branch = unique_branch("resurrect");
+        let session_name = crate::tmux::sanitize_session_name(&branch);
+        let _guard = SessionGuard(session_name.clone());
+
+        // Insert a DB session + worktree but never start the tmux session.
+        let inserted = crate::db::add_session(&mgr.conn, &crate::models::Session {
+            id: None,
+            name: session_name.clone(),
+            repo_id: repo.id.unwrap(),
+            base_branch: branch.clone(),
+            created_at: crate::utils::utc_now(),
+            last_selected_at: None,
+        });
+        crate::db::add_worktree(&mgr.conn, &crate::models::Worktree {
+            id: None,
+            repo_id: repo.id.unwrap(),
+            path: repo_path.clone(),
+            branch: branch.clone(),
+            session_id: inserted.id,
+            tmux_window: None,
+            created_at: crate::utils::utc_now(),
+        });
+        assert!(!crate::tmux::session_exists(&session_name));
+
+        mgr.resurrect_session(inserted.id.unwrap()).unwrap();
+        assert!(crate::tmux::session_exists(&session_name));
+    }
+
+    #[test]
+    fn resurrect_session_is_noop_when_already_alive() {
+        let tmp = tempdir().unwrap();
+        let (repo_path, _) = make_repo(tmp.path());
+        let mgr = make_manager();
+
+        let repo = mgr.get_or_create_repo(&repo_path);
+        let branch = unique_branch("alive");
+        let session_name = crate::tmux::sanitize_session_name(&branch);
+        let _guard = SessionGuard(session_name.clone());
+
+        // Pre-create the tmux session so resurrect_session sees a live one.
+        crate::tmux::new_session(&session_name, &repo_path).unwrap();
+        assert!(crate::tmux::session_exists(&session_name));
+
+        let inserted = crate::db::add_session(&mgr.conn, &crate::models::Session {
+            id: None,
+            name: session_name.clone(),
+            repo_id: repo.id.unwrap(),
+            base_branch: branch.clone(),
+            created_at: crate::utils::utc_now(),
+            last_selected_at: None,
+        });
+
+        mgr.resurrect_session(inserted.id.unwrap()).unwrap();
+        // Still alive, never killed and recreated.
+        assert!(crate::tmux::session_exists(&session_name));
+    }
+
+    #[test]
+    fn resurrect_session_errors_when_worktree_path_missing() {
+        let tmp = tempdir().unwrap();
+        let (repo_path, _) = make_repo(tmp.path());
+        let mgr = make_manager();
+
+        let repo = mgr.get_or_create_repo(&repo_path);
+        let branch = unique_branch("missing-path");
+        let session_name = crate::tmux::sanitize_session_name(&branch);
+        let _guard = SessionGuard(session_name.clone());
+
+        let inserted = crate::db::add_session(&mgr.conn, &crate::models::Session {
+            id: None,
+            name: session_name.clone(),
+            repo_id: repo.id.unwrap(),
+            base_branch: branch.clone(),
+            created_at: crate::utils::utc_now(),
+            last_selected_at: None,
+        });
+        // Worktree row points at a path that doesn't exist.
+        crate::db::add_worktree(&mgr.conn, &crate::models::Worktree {
+            id: None,
+            repo_id: repo.id.unwrap(),
+            path: "/var/empty/does-not-exist-trellistest".to_string(),
+            branch: branch.clone(),
+            session_id: inserted.id,
+            tmux_window: None,
+            created_at: crate::utils::utc_now(),
+        });
+
+        let result = mgr.resurrect_session(inserted.id.unwrap());
+        assert!(result.is_err());
+        assert!(!crate::tmux::session_exists(&session_name));
     }
 
     #[test]
