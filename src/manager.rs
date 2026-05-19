@@ -148,14 +148,6 @@ impl Manager {
             .unwrap_or_else(|| dirs::home_dir().unwrap().join("dev").join("worktrees"))
     }
 
-    pub fn worktree_path(&self, repo_name: &str, branch: &str) -> String {
-        self.worktrees_dir()
-            .join(repo_name)
-            .join(branch.replace("/", "-"))
-            .to_string_lossy()
-            .to_string()
-    }
-
     fn find_or_create_worktree(
         &self,
         repo: &Repo,
