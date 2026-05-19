@@ -417,8 +417,8 @@ impl Manager {
         })
     }
 
-    /// Create a worktree + session for a PR number or branch, ready for review.
-    /// Returns (session, worktree_path). Reuses existing if found.
+    /// Create or reuse worktree + session for a PR number or branch, ready
+    /// for review. Returns (session, worktree_path).
     pub fn checkout_and_review(
         &self,
         repo_path: &str,
@@ -426,69 +426,20 @@ impl Manager {
     ) -> Result<(Session, String), String> {
         let repo = self.get_or_create_repo(repo_path);
 
-        // Resolve PR number to branch name
-        let branch = if pr_or_branch.chars().all(|c| c.is_ascii_digit()) && !pr_or_branch.is_empty()
-        {
+        let branch = if pr_or_branch.chars().all(|c| c.is_ascii_digit()) && !pr_or_branch.is_empty() {
             let pr_num: i64 = pr_or_branch.parse().unwrap();
-            git::get_pr_branch(repo_path, pr_num)
-                .map_err(|e| format!("Failed to get PR branch: {}", e))?
+            git::get_pr_branch(repo_path, pr_num).map_err(|e| format!("Failed to get PR branch: {}", e))?
         } else {
             pr_or_branch.to_string()
         };
 
-        // Fetch the branch so it's available locally
         git::fetch_branch(repo_path, &branch);
 
-        // Check if we already have a session for this branch
-        let session_name = tmux::sanitize_session_name(&branch);
-        let wt_path = self.worktree_path(&repo.name, &branch);
-        let existing_session = self.get_session_by_name(&session_name);
-
-        if let Some(ref s) = existing_session {
-            if Path::new(&wt_path).exists() {
-                return Ok((s.clone(), wt_path));
-            }
-        }
-
-        // Create worktree if it doesn't already exist on disk
-        if !Path::new(&wt_path).exists() {
-            let base = format!("origin/{}", branch);
-            git::create_worktree(repo_path, &wt_path, &branch, &base)
-                .map_err(|e| format!("Failed to create worktree: {}", e))?;
-        }
-
-        if let Some(s) = existing_session {
-            return Ok((s, wt_path));
-        }
-
-        // Create session
-        let session = db::add_session(
-            &self.conn,
-            &Session {
-                id: None,
-                name: session_name.clone(),
-                repo_id: repo.id.unwrap(),
-                base_branch: branch.clone(),
-                created_at: utc_now(),
-                last_selected_at: None,
-            },
-        );
-        apply_layout(&session_name, &wt_path);
-
-        // Record worktree
-        db::add_worktree(
-            &self.conn,
-            &Worktree {
-                id: None,
-                repo_id: repo.id.unwrap(),
-                path: wt_path.clone(),
-                branch: branch.clone(),
-                session_id: session.id,
-                tmux_window: None,
-                created_at: utc_now(),
-            },
-        );
-
+        // PR review roots the new local branch at the PR's HEAD on the remote,
+        // not main — preserves the original `checkout_and_review` semantic.
+        let start_point = format!("origin/{}", branch);
+        let wt_path = self.find_or_create_worktree(&repo, &branch, &start_point)?;
+        let session = self.find_or_create_session(&repo, &branch, &wt_path)?;
         Ok((session, wt_path))
     }
 
