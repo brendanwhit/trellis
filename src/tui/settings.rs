@@ -220,7 +220,7 @@ impl ScreenBehavior for SettingsScreen {
         let footer = Line::from(vec![
             Span::styled("Enter", Style::default().fg(theme::ACCENT)),
             Span::styled(" save  ", Style::default().fg(theme::TEXT_DIM)),
-            Span::styled("Alt+Enter", Style::default().fg(theme::ACCENT)),
+            Span::styled("Shift+Enter / Ctrl+J", Style::default().fg(theme::ACCENT)),
             Span::styled(" new line  ", Style::default().fg(theme::TEXT_DIM)),
             Span::styled("Tab", Style::default().fg(theme::ACCENT)),
             Span::styled(" next field  ", Style::default().fg(theme::TEXT_DIM)),

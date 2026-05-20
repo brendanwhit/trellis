@@ -29,17 +29,21 @@ pub fn input_handle_key_ex(
     multiline: bool,
 ) {
     if multiline {
-        match code {
-            KeyCode::Enter if !modifiers.is_empty() => {
-                input.insert(*cursor, '\n');
-                *cursor += 1;
-                return;
-            }
-            KeyCode::Up | KeyCode::Down => {
-                jump_line(input, cursor, code == KeyCode::Up);
-                return;
-            }
-            _ => {}
+        // Newline insertion triggers (any of these works, so the binding
+        // survives terminals that intercept one or another):
+        //   - Enter with any modifier (Shift/Alt/Ctrl) — e.g. Shift+Enter
+        //   - Ctrl+J — the classic Unix "literal newline", almost never
+        //     intercepted by terminal emulators
+        let is_newline_insert = matches!(code, KeyCode::Enter) && !modifiers.is_empty()
+            || matches!(code, KeyCode::Char('j')) && modifiers.contains(KeyModifiers::CONTROL);
+        if is_newline_insert {
+            input.insert(*cursor, '\n');
+            *cursor += 1;
+            return;
+        }
+        if matches!(code, KeyCode::Up | KeyCode::Down) {
+            jump_line(input, cursor, code == KeyCode::Up);
+            return;
         }
     }
     match code {
