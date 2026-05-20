@@ -172,6 +172,32 @@ pub fn render_input(f: &mut Frame, area: Rect, input: &str, cursor_pos: usize) {
     f.render_widget(para, area);
 }
 
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn render_input_actually_emits_cursor_span_at_end() {
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| {
+            let area = f.area();
+            render_input(f, area, "abc", 3);
+        }).unwrap();
+        let buf = terminal.backend().buffer();
+        // Cursor should be at column 3 (the space after "abc").
+        let cursor_cell = &buf[(3u16, 0u16)];
+        let bg_matches_cursor = cursor_cell.bg == theme::CURSOR_BG;
+        // Cells before the cursor should have TEXT fg.
+        let pre_cell = &buf[(0u16, 0u16)];
+        assert_eq!(pre_cell.symbol(), "a");
+        assert!(bg_matches_cursor, "cursor cell at col 3 has bg {:?}, expected {:?}; symbol: {:?}",
+            cursor_cell.bg, theme::CURSOR_BG, cursor_cell.symbol());
+    }
+}
+
 /// Render the centered modal box and return the inner area.
 pub fn render_modal_box(f: &mut Frame, area: Rect, title: &str, width: u16, height: u16) -> Rect {
     let vert = Layout::vertical([

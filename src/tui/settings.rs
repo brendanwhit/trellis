@@ -120,13 +120,13 @@ impl ScreenBehavior for SettingsScreen {
     fn render(&self, f: &mut Frame, area: Rect, _manager: &Manager) {
         let width = 82u16;
         // Each field: 1 label + N input lines + 1 gap. Plus 4 lines of chrome
-        // (hint + gap + status + footer).
+        // (hint + gap + status + footer) and 2 lines for the modal's borders.
         let field_rows: u16 = self
             .fields
             .iter()
             .map(|f| 1 + f.line_count() as u16 + 1)
             .sum();
-        let height = (field_rows + 4).min(area.height.saturating_sub(4));
+        let height = (field_rows + 6).min(area.height.saturating_sub(4));
         let inner = super::rename::render_modal_box(f, area, "Settings", width, height);
 
         // Build constraints: hint, gap, then per-field: label + input(s) + gap, status, footer hint
@@ -278,4 +278,54 @@ fn line_offset(s: &str, cursor: usize) -> (usize, usize) {
     let line_start = s[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let line_idx = s[..cursor].matches('\n').count();
     (line_idx, cursor - line_start)
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn make_screen(repos_value: &str) -> SettingsScreen {
+        let fields = vec![
+            Field::new("repos_dir", "Repos directories", repos_value, true),
+            Field::new("worktrees_dir", "Worktrees directory", "/wt", false),
+        ];
+        SettingsScreen {
+            fields,
+            focused: 0,
+            status: String::new(),
+            status_is_error: false,
+        }
+    }
+
+    #[test]
+    fn multiline_field_renders_cursor_on_focused_line() {
+        let mgr = crate::manager::Manager::new(rusqlite::Connection::open_in_memory().unwrap());
+        crate::db::init_schema(&mgr.conn);
+        let screen = make_screen("/abc");
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| screen.render(f, f.area(), &mgr)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // Scan the buffer for any cell with CURSOR_BG background. If we don't
+        // find one, the cursor isn't rendering — that's the bug.
+        let cursor_cells: Vec<_> = (0..buf.area.width)
+            .flat_map(|x| (0..buf.area.height).map(move |y| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].bg == theme::CURSOR_BG)
+            .collect();
+        assert!(
+            !cursor_cells.is_empty(),
+            "expected at least one cell with CURSOR_BG; found none. Buffer dump:\n{}",
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }
