@@ -14,6 +14,34 @@ use super::theme;
 // ---------------------------------------------------------------------------
 
 pub fn input_handle_key(input: &mut String, cursor: &mut usize, code: KeyCode, modifiers: KeyModifiers) {
+    input_handle_key_ex(input, cursor, code, modifiers, false);
+}
+
+/// Like `input_handle_key`, plus optional multi-line support. When
+/// `multiline` is true: Enter with any modifier inserts `\n` at the cursor,
+/// and Up/Down jump the cursor to the same column on the adjacent line.
+/// Plain Enter (no modifiers) is still ignored here — callers handle save.
+pub fn input_handle_key_ex(
+    input: &mut String,
+    cursor: &mut usize,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    multiline: bool,
+) {
+    if multiline {
+        match code {
+            KeyCode::Enter if !modifiers.is_empty() => {
+                input.insert(*cursor, '\n');
+                *cursor += 1;
+                return;
+            }
+            KeyCode::Up | KeyCode::Down => {
+                jump_line(input, cursor, code == KeyCode::Up);
+                return;
+            }
+            _ => {}
+        }
+    }
     match code {
         KeyCode::Char(c) => {
             // Ctrl+U: clear line
@@ -79,6 +107,37 @@ pub fn input_handle_key(input: &mut String, cursor: &mut usize, code: KeyCode, m
             *cursor = input.len();
         }
         _ => {}
+    }
+}
+
+fn jump_line(input: &str, cursor: &mut usize, up: bool) {
+    // Find start of current line and column within it.
+    let cur = *cursor;
+    let line_start = input[..cur].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let col = cur - line_start;
+
+    if up {
+        // Find start of previous line, if any.
+        if line_start == 0 {
+            return;
+        }
+        let prev_line_end = line_start - 1; // position of the `\n`
+        let prev_line_start = input[..prev_line_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let prev_line_len = prev_line_end - prev_line_start;
+        *cursor = prev_line_start + col.min(prev_line_len);
+    } else {
+        // Find end of current line (next `\n`) and start of next.
+        let cur_line_end = match input[cur..].find('\n') {
+            Some(rel) => cur + rel,
+            None => return, // no next line
+        };
+        let next_line_start = cur_line_end + 1;
+        let next_line_end = input[next_line_start..]
+            .find('\n')
+            .map(|r| next_line_start + r)
+            .unwrap_or(input.len());
+        let next_line_len = next_line_end - next_line_start;
+        *cursor = next_line_start + col.min(next_line_len);
     }
 }
 
