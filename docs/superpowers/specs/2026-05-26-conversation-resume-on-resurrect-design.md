@@ -88,7 +88,7 @@ After:
 pub fn apply_layout(session_name: &str, working_dir: &str, claude_cmd: &str)
 ```
 
-Inside, the first window's send-keys uses `claude_cmd` instead of `DEFAULT_LAYOUT[0].1`. `DEFAULT_LAYOUT[0].1` can be removed (or kept as a `DEFAULT_CLAUDE_CMD: &str = "claude"` constant for clarity).
+Inside, the first window's send-keys uses `claude_cmd` instead of `DEFAULT_LAYOUT[0].1`. Set `DEFAULT_LAYOUT[0].1 = None` — `apply_layout` no longer owns the claude command, so the layout constant no longer needs to carry it. The literal `"claude"` lives at the two non-resurrect call sites.
 
 Three call-site categories:
 
@@ -96,7 +96,13 @@ Three call-site categories:
 |---|---|
 | `find_or_create_session` (line 268) | `"claude"` |
 | `resurrect_session` (line 234) | `claude --resume <id>` if found, else `"claude"` |
-| Test fixtures in `resurrect_session_*` tests (line 1138 and similar) | `"claude"` |
+| `apply_layout_creates_named_windows_independent_of_base_index` test (line 1153) | `"claude"` |
+
+The four `resurrect_session_*` tests at lines 1138, 1200, 1236, 1271 do not need direct updates — they call through `mgr.resurrect_session`, which already handles the new argument internally.
+
+### UUID quoting
+
+The resume command is built via `format!("claude --resume {}", id)` and sent through `tmux send-keys`. Claude conversation IDs are hex-and-dash UUIDs (e.g. `d4199215-d987-4117-817d-1d48106b242a`) with no shell metacharacters, so no quoting or escaping is needed at the format-string or send-keys layer.
 
 ### Resurrect wiring
 
