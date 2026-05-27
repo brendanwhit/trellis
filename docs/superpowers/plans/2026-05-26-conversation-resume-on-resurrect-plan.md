@@ -18,7 +18,7 @@
 
 **Build commands:**
 - All tests: `cargo test`
-- Tests in a single module: `cargo test claude_pane::tests --lib`
+- Tests in a single module: `cargo test claude_pane::tests`
 - A single test by name: `cargo test <name> -- --nocapture`
 - Lint: `cargo clippy --all-targets`
 - Build: `cargo build`
@@ -57,7 +57,7 @@ No new imports are needed — `src/claude_pane.rs` already has `use std::fs;` an
 
 - [ ] **Step 2: Run the test to verify it fails (compile error)**
 
-Run: `cargo test --lib claude_pane::tests::find_latest_returns_none_when_encoded_dir_missing`
+Run: `cargo test claude_pane::tests::find_latest_returns_none_when_encoded_dir_missing`
 Expected: compile error — `find_latest_conversation_in` is not defined.
 
 - [ ] **Step 3: Add the function stub**
@@ -77,7 +77,7 @@ fn find_latest_conversation_in(projects_dir: &Path, cwd: &Path) -> Option<String
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cargo test --lib claude_pane::tests::find_latest_returns_none_when_encoded_dir_missing`
+Run: `cargo test claude_pane::tests::find_latest_returns_none_when_encoded_dir_missing`
 Expected: 1 passed.
 
 - [ ] **Step 5: Commit**
@@ -132,7 +132,7 @@ fn find_latest_returns_newest_jsonl_by_mtime() {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test --lib claude_pane::tests::find_latest_returns_newest_jsonl_by_mtime`
+Run: `cargo test claude_pane::tests::find_latest_returns_newest_jsonl_by_mtime`
 Expected: FAIL — assertion fails because the stub returns `None`.
 
 - [ ] **Step 3: Replace the stub with the real implementation**
@@ -170,7 +170,7 @@ fn find_latest_conversation_in(projects_dir: &Path, cwd: &Path) -> Option<String
 
 - [ ] **Step 4: Run both tests and verify they pass**
 
-Run: `cargo test --lib claude_pane::tests`
+Run: `cargo test claude_pane::tests`
 Expected: all `claude_pane` tests pass, including both new ones.
 
 - [ ] **Step 5: Commit**
@@ -222,7 +222,7 @@ fn find_latest_ignores_non_jsonl_files() {
 
 - [ ] **Step 2: Run the test (expected: passes immediately)**
 
-Run: `cargo test --lib claude_pane::tests::find_latest_ignores_non_jsonl_files`
+Run: `cargo test claude_pane::tests::find_latest_ignores_non_jsonl_files`
 Expected: PASS. The extension filter added in Task 2 already enforces this.
 
 - [ ] **Step 3: Commit**
@@ -261,7 +261,7 @@ fn find_latest_returns_none_when_dir_has_no_jsonl() {
 
 - [ ] **Step 2: Run the test**
 
-Run: `cargo test --lib claude_pane::tests::find_latest_returns_none_when_dir_has_no_jsonl`
+Run: `cargo test claude_pane::tests::find_latest_returns_none_when_dir_has_no_jsonl`
 Expected: PASS. `best` stays `None` when the loop finds no `.jsonl` entries.
 
 - [ ] **Step 3: Commit**
@@ -302,7 +302,7 @@ fn find_latest_encoded_cwd_uses_dash_substitution() {
 
 - [ ] **Step 2: Run the test**
 
-Run: `cargo test --lib claude_pane::tests::find_latest_encoded_cwd_uses_dash_substitution`
+Run: `cargo test claude_pane::tests::find_latest_encoded_cwd_uses_dash_substitution`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
