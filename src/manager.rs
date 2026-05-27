@@ -214,7 +214,10 @@ impl Manager {
             return Err(format!("path '{}' no longer exists", wt_path));
         }
 
-        apply_layout(&session.name, &wt_path, "claude");
+        let claude_cmd = crate::claude_pane::find_latest_conversation(Path::new(&wt_path))
+            .map(|id| format!("claude --resume {}", id))
+            .unwrap_or_else(|| "claude".to_string());
+        apply_layout(&session.name, &wt_path, &claude_cmd);
 
         if !tmux::session_exists(&session.name) {
             return Err(format!("failed to create tmux session '{}'", session.name));
