@@ -129,6 +129,15 @@ pub fn classify_pane(pane_text: &str) -> &'static str {
     "idle"
 }
 
+/// Find the most-recent Claude conversation that ran in `cwd`, looking under
+/// `projects_dir/<encoded-cwd>/`. Returns the bare UUID (no `.jsonl` extension).
+///
+/// `projects_dir` is the `~/.claude/projects` location (parameterized for tests).
+fn find_latest_conversation_in(projects_dir: &Path, cwd: &Path) -> Option<String> {
+    let _ = (projects_dir, cwd);
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +205,14 @@ mod tests {
         assert_eq!(classify_pane("✻ Baked for 2m 36s"), "idle");
         assert_eq!(classify_pane("✻ Cogitated for 43s"), "idle");
         assert_eq!(classify_pane("✻ Cooked for 3m 17s"), "idle");
+    }
+
+    #[test]
+    fn find_latest_returns_none_when_encoded_dir_missing() {
+        use tempfile::tempdir;
+        let projects = tempdir().unwrap();
+        // /nope/here doesn't have a corresponding encoded dir in projects/
+        let result = find_latest_conversation_in(projects.path(), Path::new("/nope/here"));
+        assert!(result.is_none());
     }
 }
