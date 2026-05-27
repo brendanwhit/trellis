@@ -134,8 +134,30 @@ pub fn classify_pane(pane_text: &str) -> &'static str {
 ///
 /// `projects_dir` is the `~/.claude/projects` location (parameterized for tests).
 fn find_latest_conversation_in(projects_dir: &Path, cwd: &Path) -> Option<String> {
-    let _ = (projects_dir, cwd);
-    None
+    let encoded = cwd.to_string_lossy().replace('/', "-");
+    let dir = projects_dir.join(&encoded);
+    let entries = fs::read_dir(&dir).ok()?;
+
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let mtime = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        match &best {
+            Some((best_mtime, _)) if mtime <= *best_mtime => {}
+            _ => best = Some((mtime, stem)),
+        }
+    }
+    best.map(|(_, stem)| stem)
 }
 
 #[cfg(test)]
@@ -214,5 +236,33 @@ mod tests {
         // /nope/here doesn't have a corresponding encoded dir in projects/
         let result = find_latest_conversation_in(projects.path(), Path::new("/nope/here"));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_latest_returns_newest_jsonl_by_mtime() {
+        use std::fs::File;
+        use std::thread::sleep;
+        use std::time::Duration;
+        use tempfile::tempdir;
+
+        let projects = tempdir().unwrap();
+        // cwd we'll fake: /foo/bar -> encoded as "-foo-bar"
+        let cwd = Path::new("/foo/bar");
+        let encoded = projects.path().join("-foo-bar");
+        fs::create_dir_all(&encoded).unwrap();
+
+        // Create three jsonls with distinct mtimes by sleeping between creates.
+        // 10ms is enough on every filesystem we care about.
+        File::create(encoded.join("aaaa.jsonl")).unwrap();
+        sleep(Duration::from_millis(10));
+        File::create(encoded.join("bbbb.jsonl")).unwrap();
+        sleep(Duration::from_millis(10));
+        File::create(encoded.join("cccc.jsonl")).unwrap();
+        // Now touch bbbb to make IT the newest by mtime.
+        sleep(Duration::from_millis(10));
+        File::create(encoded.join("bbbb.jsonl")).unwrap();
+
+        let result = find_latest_conversation_in(projects.path(), cwd);
+        assert_eq!(result.as_deref(), Some("bbbb"));
     }
 }
