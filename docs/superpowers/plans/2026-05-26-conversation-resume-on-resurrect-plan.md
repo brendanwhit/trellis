@@ -53,7 +53,7 @@ fn find_latest_returns_none_when_encoded_dir_missing() {
 }
 ```
 
-Add `use std::path::PathBuf;` to the top of `src/claude_pane.rs` if it isn't already there (it currently has only `std::path::Path`).
+No new imports are needed — `src/claude_pane.rs` already has `use std::fs;` and `use std::path::Path;`, which cover the test and implementation. (`tempfile` is in dev-dependencies; the test brings it in scope with `use tempfile::tempdir;`.)
 
 - [ ] **Step 2: Run the test to verify it fails (compile error)**
 
