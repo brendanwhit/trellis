@@ -15,7 +15,7 @@ use crate::utils::utc_now;
 
 /// Default tmux layout: (window_name, optional command to send).
 const DEFAULT_LAYOUT: &[(&str, Option<&str>)] = &[
-    ("claude", Some("claude")),
+    ("claude", None),
     ("shell", None),
 ];
 
@@ -24,15 +24,13 @@ const DEFAULT_LAYOUT: &[(&str, Option<&str>)] = &[
 /// The first layout entry becomes the session's initial window — named at
 /// `tmux new-session` time via `-n`, so we don't depend on tmux's
 /// configurable `base-index`. Subsequent entries become additional windows.
-pub fn apply_layout(session_name: &str, working_dir: &str) {
-    let (first_name, first_command) = DEFAULT_LAYOUT[0];
+pub fn apply_layout(session_name: &str, working_dir: &str, claude_cmd: &str) {
+    let (first_name, _) = DEFAULT_LAYOUT[0];
     if let Err(_) = tmux::new_session(session_name, working_dir, Some(first_name)) {
         return;
     }
-    if let Some(cmd) = first_command {
-        let target = format!("{}:{}", session_name, first_name);
-        tmux::send_keys(&target, &[cmd, "Enter"]);
-    }
+    let target = format!("{}:{}", session_name, first_name);
+    tmux::send_keys(&target, &[claude_cmd, "Enter"]);
 
     for &(name, command) in &DEFAULT_LAYOUT[1..] {
         let _ = tmux::new_window(session_name, name, Some(working_dir));
@@ -216,7 +214,7 @@ impl Manager {
             return Err(format!("path '{}' no longer exists", wt_path));
         }
 
-        apply_layout(&session.name, &wt_path);
+        apply_layout(&session.name, &wt_path, "claude");
 
         if !tmux::session_exists(&session.name) {
             return Err(format!("failed to create tmux session '{}'", session.name));
@@ -250,7 +248,7 @@ impl Manager {
                 last_selected_at: None,
             },
         );
-        apply_layout(&session_name, wt_path);
+        apply_layout(&session_name, wt_path, "claude");
 
         if wt_path != repo.path && db::get_worktree_by_path(&self.conn, wt_path).is_none() {
             db::add_worktree(
@@ -386,7 +384,7 @@ impl Manager {
                 last_selected_at: None,
             },
         );
-        apply_layout(&chosen_name, &effective_dir);
+        apply_layout(&chosen_name, &effective_dir, "claude");
 
         if wt_path != repo.path && db::get_worktree_by_path(&self.conn, &wt_path).is_none() {
             db::add_worktree(
@@ -1086,7 +1084,7 @@ mod tests {
         let session_name = format!("trellistest-layout-{}", std::process::id());
         let _guard = SessionGuard(session_name.clone());
 
-        apply_layout(&session_name, &tmp.path().to_string_lossy());
+        apply_layout(&session_name, &tmp.path().to_string_lossy(), "claude");
         assert!(crate::tmux::session_exists(&session_name));
 
         let windows = crate::tmux::list_windows(&session_name);
