@@ -265,4 +265,29 @@ mod tests {
         let result = find_latest_conversation_in(projects.path(), cwd);
         assert_eq!(result.as_deref(), Some("bbbb"));
     }
+
+    #[test]
+    fn find_latest_ignores_non_jsonl_files() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::thread::sleep;
+        use std::time::Duration;
+        use tempfile::tempdir;
+
+        let projects = tempdir().unwrap();
+        let cwd = Path::new("/foo/bar");
+        let encoded = projects.path().join("-foo-bar");
+        fs::create_dir_all(&encoded).unwrap();
+
+        // Create the .jsonl FIRST, then a .txt later. If extension filtering were
+        // missing, the .txt's newer mtime would win and the result would be a
+        // bare stem ("notes") that doesn't match what we want.
+        File::create(encoded.join("real.jsonl")).unwrap();
+        sleep(Duration::from_millis(10));
+        let mut txt = File::create(encoded.join("notes.txt")).unwrap();
+        txt.write_all(b"distractor").unwrap();
+
+        let result = find_latest_conversation_in(projects.path(), cwd);
+        assert_eq!(result.as_deref(), Some("real"));
+    }
 }
