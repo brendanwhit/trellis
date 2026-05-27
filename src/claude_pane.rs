@@ -290,4 +290,18 @@ mod tests {
         let result = find_latest_conversation_in(projects.path(), cwd);
         assert_eq!(result.as_deref(), Some("real"));
     }
+
+    #[test]
+    fn find_latest_returns_none_when_dir_has_no_jsonl() {
+        use tempfile::tempdir;
+
+        let projects = tempdir().unwrap();
+        let cwd = Path::new("/foo/bar");
+        let encoded = projects.path().join("-foo-bar");
+        fs::create_dir_all(encoded.join("subagents")).unwrap();
+        // No .jsonl files at the top level.
+
+        let result = find_latest_conversation_in(projects.path(), cwd);
+        assert!(result.is_none());
+    }
 }
