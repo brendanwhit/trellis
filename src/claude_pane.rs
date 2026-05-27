@@ -129,6 +129,16 @@ pub fn classify_pane(pane_text: &str) -> &'static str {
     "idle"
 }
 
+/// Find the most-recent Claude conversation that ran in `cwd`.
+///
+/// Returns the bare conversation UUID (no `.jsonl` extension), or `None` if
+/// no prior conversation exists for this cwd or any I/O error prevents
+/// reading the projects directory.
+pub fn find_latest_conversation(cwd: &Path) -> Option<String> {
+    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    find_latest_conversation_in(&projects_dir, cwd)
+}
+
 /// Find the most-recent Claude conversation that ran in `cwd`, looking under
 /// `projects_dir/<encoded-cwd>/`. Returns the bare UUID (no `.jsonl` extension).
 ///
