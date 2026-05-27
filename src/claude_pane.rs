@@ -304,4 +304,20 @@ mod tests {
         let result = find_latest_conversation_in(projects.path(), cwd);
         assert!(result.is_none());
     }
+
+    #[test]
+    fn find_latest_encoded_cwd_uses_dash_substitution() {
+        use std::fs::File;
+        use tempfile::tempdir;
+
+        let projects = tempdir().unwrap();
+        // Three-segment cwd to make the encoding non-trivial.
+        let cwd = Path::new("/a/b/c");
+        let expected_dir = projects.path().join("-a-b-c");
+        fs::create_dir_all(&expected_dir).unwrap();
+        File::create(expected_dir.join("only.jsonl")).unwrap();
+
+        let result = find_latest_conversation_in(projects.path(), cwd);
+        assert_eq!(result.as_deref(), Some("only"));
+    }
 }
