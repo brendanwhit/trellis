@@ -115,6 +115,17 @@ pub fn inside_tmux() -> bool {
     std::env::var("TMUX").is_ok()
 }
 
+/// Return the working directory of the active pane in the given session, or
+/// None if tmux can't resolve it (session missing, no panes, etc.).
+pub fn session_active_pane_path(session: &str) -> Option<String> {
+    let output = run(&["display-message", "-p", "-t", session, "#{pane_current_path}"]);
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() { None } else { Some(path) }
+}
+
 pub fn new_window(session: &str, name: &str, start_dir: Option<&str>) -> Result<(), TmuxError> {
     let mut args = vec!["new-window", "-t", session, "-n", name];
     if let Some(dir) = start_dir {
