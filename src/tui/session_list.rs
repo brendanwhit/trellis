@@ -127,13 +127,27 @@ fn looks_like_claude_command(s: &str) -> bool {
     parts.len() >= 3 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
 }
 
+/// If `session_name` is the calling client's currently attached session, switch
+/// the client to any other live tmux session first so that killing it doesn't
+/// detach the client (which would close the surrounding wezterm tab when
+/// trellis runs inside a popup). No-op when there's no other session to fall
+/// back to — caller accepts that tmux will exit in that case.
+fn switch_off_if_attached(session_name: &str) {
+    if tmux::attached_session().as_deref() != Some(session_name) {
+        return;
+    }
+    if let Some(other) = tmux::list_sessions().into_iter().find(|s| s.name != session_name) {
+        let _ = tmux::switch_client(&other.name);
+    }
+}
+
 // --------------------------------------------------------------------------
 // SessionListScreen
 // --------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 enum ConfirmAction {
-    DeleteSession { session_id: i64 },
+    DeleteSession { session_id: i64, session_name: String },
     KillTab { session_name: String, window_index: i64 },
     KillSession { session_name: String },
 }
@@ -721,12 +735,13 @@ impl SessionListScreen {
             return ScreenAction::None;
         }
 
-        // Rename session
+        // Rename session — managed sessions update both tmux and the DB;
+        // unmanaged live sessions are renamed in tmux only (session_id is None).
         let session = match self.current_session() {
             Some(s) => s.clone(),
             None => return ScreenAction::None,
         };
-        if session.managed {
+        if session.managed || session.live {
             self.inline_mode = InlineMode::Rename {
                 input: session.name.clone(),
                 cursor: session.name.len(),
@@ -809,7 +824,7 @@ impl SessionListScreen {
             };
             self.inline_mode = InlineMode::Confirm {
                 message: msg,
-                action: ConfirmAction::DeleteSession { session_id: session.id.unwrap() },
+                action: ConfirmAction::DeleteSession { session_id: session.id.unwrap(), session_name: session.name.clone() },
             };
             ScreenAction::None
         } else {
@@ -1005,6 +1020,19 @@ impl SessionListScreen {
                             self.inline_mode = InlineMode::None;
                             return ScreenAction::None;
                         }
+                    } else {
+                        // Unmanaged live session — tmux rename only.
+                        if sanitized != session_name
+                            && tmux::list_sessions().iter().any(|s| s.name == sanitized)
+                        {
+                            self.status_message = Some(format!("Session '{}' already exists.", sanitized));
+                            return ScreenAction::None;
+                        }
+                        if let Err(e) = tmux::rename_session(&session_name, &sanitized) {
+                            self.status_message = Some(format!("Error: {}", e));
+                            self.inline_mode = InlineMode::None;
+                            return ScreenAction::None;
+                        }
                     }
                 } else if let Some(win_idx) = window_index {
                     if let Err(e) = tmux::rename_window(&session_name, win_idx, &name) {
@@ -1041,13 +1069,15 @@ impl SessionListScreen {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 match action {
-                    ConfirmAction::DeleteSession { session_id } => {
+                    ConfirmAction::DeleteSession { session_id, session_name } => {
+                        switch_off_if_attached(&session_name);
                         let _ = manager.delete_session(session_id, false);
                     }
                     ConfirmAction::KillTab { session_name, window_index } => {
                         let _ = tmux::kill_window(&session_name, window_index);
                     }
                     ConfirmAction::KillSession { session_name } => {
+                        switch_off_if_attached(&session_name);
                         let _ = tmux::kill_session(&session_name);
                     }
                 }
