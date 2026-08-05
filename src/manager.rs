@@ -364,12 +364,6 @@ impl Manager {
             .find(|s| s.id == Some(session_id))
     }
 
-    fn get_worktree_by_id(&self, worktree_id: i64) -> Option<Worktree> {
-        db::get_worktrees(&self.conn)
-            .into_iter()
-            .find(|wt| wt.id == Some(worktree_id))
-    }
-
     fn get_or_create_repo(&self, repo_path: &str) -> Repo {
         if let Some(repo) = self.get_repo_by_path(repo_path) {
             return repo;
@@ -693,27 +687,11 @@ impl Manager {
         Ok(())
     }
 
-    /// Remove git worktree and delete DB record.
-    pub fn cleanup_worktree(&self, worktree_id: i64) -> Result<(), String> {
-        let wt = self
-            .get_worktree_by_id(worktree_id)
-            .ok_or_else(|| format!("Worktree {} not found", worktree_id))?;
-
-        let repo = self
-            .get_repo_by_id(wt.repo_id)
-            .ok_or_else(|| format!("Repo {} not found", wt.repo_id))?;
-
-        // Try to remove the git worktree; if it fails (e.g. directory already gone),
-        // still delete the DB record
-        if let Err(e) = git::remove_worktree(&repo.path, &wt.path) {
-            // If the directory doesn't exist, just clean up the DB record
-            if std::path::Path::new(&wt.path).exists() {
-                return Err(format!("Failed to remove worktree: {}", e));
-            }
-        }
+    /// Drop the DB record for a worktree. The git removal is the slow half and
+    /// runs on a worker thread; this is the commit the main thread applies once
+    /// the worker reports the directory is gone.
+    pub fn forget_worktree(&self, worktree_id: i64) {
         db::delete_worktree(&self.conn, worktree_id);
-
-        Ok(())
     }
 
     /// Return DB sessions enriched with live tmux state, plus unmanaged live sessions.
