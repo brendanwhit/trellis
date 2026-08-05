@@ -250,6 +250,9 @@ pub struct SessionListScreen {
     snapshot: TmuxSnapshot,
     poll_job: Option<Job<TmuxSnapshot>>,
     last_poll: Instant,
+    /// gh/git network work for a PR review, plus the repo it belongs to.
+    review_job: Option<Job<Result<String, String>>>,
+    review_repo: Option<String>,
 }
 
 impl SessionListScreen {
@@ -270,6 +273,8 @@ impl SessionListScreen {
             snapshot: gather_snapshot(&HashSet::new()),
             poll_job: None,
             last_poll: Instant::now(),
+            review_job: None,
+            review_repo: None,
         };
         screen.refresh(manager);
         screen
@@ -286,6 +291,51 @@ impl SessionListScreen {
             let _ = tx.send(JobMsg::Item(gather_snapshot(&expanded_names)));
             let _ = tx.send(JobMsg::Done);
         }));
+    }
+
+    fn reviewing(&self) -> bool {
+        self.review_job.is_some()
+    }
+
+    /// Finish a PR review once the fetch lands. Runs the db/worktree half here
+    /// on the main thread, then hands back the switch that ends the app.
+    fn apply_review_results(&mut self, manager: &Manager) -> ScreenAction {
+        let Some(job) = self.review_job.as_mut() else {
+            return ScreenAction::None;
+        };
+        let resolved = job.drain().pop();
+        let finished = job.finished();
+
+        let Some(resolved) = resolved else {
+            if finished {
+                // Worker died without a result.
+                self.review_job = None;
+                self.review_repo = None;
+                self.status_message = Some("Review fetch failed.".to_string());
+            }
+            return ScreenAction::None;
+        };
+
+        self.review_job = None;
+        let repo_path = self.review_repo.take().unwrap_or_default();
+
+        let branch = match resolved {
+            Ok(b) => b,
+            Err(e) => {
+                self.status_message = Some(format!("Error: {}", e));
+                return ScreenAction::None;
+            }
+        };
+
+        match manager.checkout_and_review(&repo_path, &branch) {
+            Ok((session, _worktree_path)) => {
+                ScreenAction::Switch(SwitchAction::Session { target: session.name })
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Error: {}", e));
+                ScreenAction::None
+            }
+        }
     }
 
     /// Swap in a finished snapshot and rebuild, then re-arm the interval.
@@ -914,6 +964,10 @@ impl SessionListScreen {
     }
 
     fn action_review(&mut self, manager: &Manager) -> ScreenAction {
+        if self.reviewing() {
+            self.status_message = Some("A review fetch is already running.".to_string());
+            return ScreenAction::None;
+        }
         let mut repos = manager.get_repos();
         if repos.is_empty() {
             self.status_message = Some("No repos configured.".to_string());
@@ -1270,7 +1324,7 @@ impl SessionListScreen {
         self.refresh(manager);
     }
 
-    fn handle_review_key(&mut self, code: KeyCode, modifiers: crossterm::event::KeyModifiers, manager: &mut Manager) -> ScreenAction {
+    fn handle_review_key(&mut self, code: KeyCode, modifiers: crossterm::event::KeyModifiers, _manager: &mut Manager) -> ScreenAction {
         match code {
             KeyCode::Tab => {
                 if let InlineMode::Review { repo_index, repos, .. } = &mut self.inline_mode {
@@ -1297,17 +1351,20 @@ impl SessionListScreen {
                 }
                 self.inline_mode = InlineMode::None;
 
-                match manager.checkout_and_review(&repo.path, &input) {
-                    Ok((session, _worktree_path)) => {
-                        ScreenAction::Switch(SwitchAction::Session {
-                            target: session.name,
-                        })
-                    }
-                    Err(e) => {
-                        self.status_message = Some(format!("Error: {}", e));
-                        ScreenAction::None
-                    }
-                }
+                // `gh pr view` plus `git fetch` is two network round trips; the
+                // local half runs on the main thread once this lands.
+                let repo_path = repo.path.clone();
+                self.review_repo = Some(repo_path.clone());
+                self.review_job = Some(Job::spawn(
+                    format!("Fetching {}", input),
+                    None,
+                    move |tx| {
+                        let resolved = Manager::resolve_review_branch(&repo_path, &input);
+                        let _ = tx.send(JobMsg::Item(resolved));
+                        let _ = tx.send(JobMsg::Done);
+                    },
+                ));
+                ScreenAction::None
             }
             KeyCode::Esc => {
                 self.inline_mode = InlineMode::None;
@@ -1428,7 +1485,17 @@ impl SessionListScreen {
 
 impl ScreenBehavior for SessionListScreen {
     fn tick(&mut self, manager: &mut Manager) -> ScreenAction {
+        let action = self.apply_review_results(manager);
+        if !matches!(action, ScreenAction::None) {
+            return action;
+        }
         self.poll_results(manager);
+        // Run deferred slow work the frame after the user confirmed it. Draw
+        // happens before tick in the main loop, so the "Working…" overlay is
+        // already on-screen by the time we block here.
+        if matches!(self.inline_mode, InlineMode::Working { .. }) {
+            self.run_pending_work(manager);
+        }
         ScreenAction::None
     }
 
@@ -1438,7 +1505,9 @@ impl ScreenBehavior for SessionListScreen {
         let filter_height = if has_filter { 1 } else { 0 };
 
         let status_height = match &self.inline_mode {
-            InlineMode::None => if self.status_message.is_some() { 1 } else { 0 },
+            InlineMode::None => {
+                if self.status_message.is_some() || self.reviewing() { 1 } else { 0 }
+            }
             InlineMode::Working { .. } => 0,
             _ => 1,
         };
@@ -1463,6 +1532,12 @@ impl ScreenBehavior for SessionListScreen {
             };
             let filter_widget = Paragraph::new(filter_text).style(filter_style);
             f.render_widget(filter_widget, chunks[0]);
+        }
+
+        // Background work indicator (PR review fetch)
+        if let Some(ref job) = self.review_job {
+            let indicator = Paragraph::new(job.indicator_line()).style(Style::default().bg(theme::BG));
+            f.render_widget(indicator, chunks[2]);
         }
 
         // Build table rows
@@ -1807,16 +1882,6 @@ impl ScreenBehavior for SessionListScreen {
     }
 
     fn on_child_result(&mut self, _result: ActionResult, _manager: &mut Manager) -> ScreenAction {
-        ScreenAction::None
-    }
-
-    fn tick(&mut self, manager: &mut Manager) -> ScreenAction {
-        // Run deferred slow work the frame after the user confirmed it. Draw
-        // happens before tick in the main loop, so the "Working…" overlay is
-        // already on-screen by the time we block here.
-        if matches!(self.inline_mode, InlineMode::Working { .. }) {
-            self.run_pending_work(manager);
-        }
         ScreenAction::None
     }
 

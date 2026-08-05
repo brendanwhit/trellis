@@ -545,13 +545,10 @@ impl Manager {
 
     /// Create or reuse worktree + session for a PR number or branch, ready
     /// for review. Returns (session, worktree_path).
-    pub fn checkout_and_review(
-        &self,
-        repo_path: &str,
-        pr_or_branch: &str,
-    ) -> Result<(Session, String), String> {
-        let repo = self.get_or_create_repo(repo_path);
-
+    /// The network half of a PR review: resolve a PR number to its branch via
+    /// `gh`, then fetch it. Two round trips, so callers run this on a worker —
+    /// it needs no connection, only paths.
+    pub fn resolve_review_branch(repo_path: &str, pr_or_branch: &str) -> Result<String, String> {
         let branch = if pr_or_branch.chars().all(|c| c.is_ascii_digit()) && !pr_or_branch.is_empty() {
             let pr_num: i64 = pr_or_branch.parse().unwrap();
             git::get_pr_branch(repo_path, pr_num).map_err(|e| format!("Failed to get PR branch: {}", e))?
@@ -560,12 +557,22 @@ impl Manager {
         };
 
         git::fetch_branch(repo_path, &branch);
+        Ok(branch)
+    }
+
+    /// The local half, once the branch is fetched: worktree, session and db rows.
+    pub fn checkout_and_review(
+        &self,
+        repo_path: &str,
+        branch: &str,
+    ) -> Result<(Session, String), String> {
+        let repo = self.get_or_create_repo(repo_path);
 
         // PR review roots the new local branch at the PR's HEAD on the remote,
         // not main — preserves the original `checkout_and_review` semantic.
         let start_point = format!("origin/{}", branch);
-        let wt_path = self.find_or_create_worktree(&repo, &branch, &start_point)?;
-        let session = self.find_or_create_session(&repo, &branch, &wt_path)?;
+        let wt_path = self.find_or_create_worktree(&repo, branch, &start_point)?;
+        let session = self.find_or_create_session(&repo, branch, &wt_path)?;
         Ok((session, wt_path))
     }
 
@@ -695,13 +702,9 @@ impl Manager {
     }
 
     /// Return DB sessions enriched with live tmux state, plus unmanaged live sessions.
-    pub fn list_sessions(&self) -> Vec<SessionInfo> {
-        self.list_sessions_with(&tmux::list_sessions())
-    }
-
-    /// Same, but against an already-gathered tmux listing. Callers that poll tmux
-    /// on a worker thread pass their snapshot in so the process spawn doesn't
-    /// happen on the event loop.
+    /// Enrich the db's sessions with live tmux state, plus any live sessions the
+    /// db doesn't know about. Takes an already-gathered tmux listing so the
+    /// process spawn happens on a worker, not the event loop.
     pub fn list_sessions_with(&self, live_list: &[tmux::TmuxSession]) -> Vec<SessionInfo> {
         let db_sessions = db::get_sessions(&self.conn);
         let live_by_name: HashMap<String, &tmux::TmuxSession> = live_list
@@ -1342,6 +1345,29 @@ mod reuse_tests {
     /// alphanumerics alone, so the sanitized version is identical.
     fn unique_branch(suffix: &str) -> String {
         format!("trellistest-{}-{}", std::process::id(), suffix)
+    }
+
+    #[test]
+    fn review_input_that_is_not_a_pr_number_is_used_as_the_branch_verbatim() {
+        let tmp = tempdir().unwrap();
+        let (repo_path, _) = make_repo(tmp.path());
+
+        // Non-numeric input must not be sent to `gh`; it is already a branch.
+        // The fetch that follows is best-effort and fails silently with no remote.
+        let branch = Manager::resolve_review_branch(&repo_path, "feat/some-branch").unwrap();
+
+        assert_eq!(branch, "feat/some-branch");
+    }
+
+    #[test]
+    fn review_input_with_a_slash_is_never_treated_as_a_pr_number() {
+        let tmp = tempdir().unwrap();
+        let (repo_path, _) = make_repo(tmp.path());
+
+        // Guards the digit test against matching things like "123/foo".
+        let branch = Manager::resolve_review_branch(&repo_path, "123/foo").unwrap();
+
+        assert_eq!(branch, "123/foo");
     }
 
     #[test]
