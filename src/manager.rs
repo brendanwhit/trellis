@@ -696,8 +696,14 @@ impl Manager {
 
     /// Return DB sessions enriched with live tmux state, plus unmanaged live sessions.
     pub fn list_sessions(&self) -> Vec<SessionInfo> {
+        self.list_sessions_with(&tmux::list_sessions())
+    }
+
+    /// Same, but against an already-gathered tmux listing. Callers that poll tmux
+    /// on a worker thread pass their snapshot in so the process spawn doesn't
+    /// happen on the event loop.
+    pub fn list_sessions_with(&self, live_list: &[tmux::TmuxSession]) -> Vec<SessionInfo> {
         let db_sessions = db::get_sessions(&self.conn);
-        let live_list = tmux::list_sessions();
         let live_by_name: HashMap<String, &tmux::TmuxSession> = live_list
             .iter()
             .map(|s| (s.name.clone(), s))
@@ -723,7 +729,7 @@ impl Manager {
         }
 
         // Include live tmux sessions not tracked in the DB
-        for ts in &live_list {
+        for ts in live_list {
             if !db_names.contains(&ts.name) {
                 result.push(SessionInfo {
                     id: None,
