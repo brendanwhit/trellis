@@ -299,6 +299,10 @@ pub fn send_keys(target: &str, keys: &[&str]) {
 }
 
 
+pub fn display_message(target: &str, message: &str) {
+    run(&["display-message", "-t", target, "-d", "8000", message]);
+}
+
 pub fn kill_session(name: &str) -> Result<(), TmuxError> {
     let output = run(&["kill-session", "-t", name]);
     if !output.status.success() {

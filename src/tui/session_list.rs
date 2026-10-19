@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use md5::{Md5, Digest};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::agent_pane::{self, PaneStatus};
 use crate::fuzzy::fuzzy_match_multi;
@@ -186,7 +186,7 @@ fn open_agent_window(
     // Target by window id: it stays unambiguous when another window in the
     // session shares the name.
     let window_id = tmux::new_window(session_name, window_name, cwd.as_deref())?;
-    let mut cmd = manager.agent_cmd();
+    let mut cmd = manager.agent_for_name(session_name);
     for arg in args {
         cmd.push(' ');
         cmd.push_str(arg);
@@ -1085,7 +1085,7 @@ impl SessionListScreen {
             // "rename" removed — use `r` directly
             items.push(("branch".to_string(), "Change branch".to_string()));
             if session.live {
-                items.push(("agent".to_string(), format!("Launch {}", manager.agent_cmd())));
+                items.push(("agent".to_string(), format!("Launch {}", manager.agent_for_name(&session.name))));
             }
         } else if session.live {
             items.push(("adopt".to_string(), "Adopt session".to_string()));
@@ -1424,7 +1424,7 @@ impl SessionListScreen {
                     Ok(_) => {
                         tmux::send_keys(
                             &format!("{}:{}", session_name, input),
-                            &[&manager.agent_cmd(), "Enter"],
+                            &[&manager.agent_for_name(&session_name), "Enter"],
                         );
                         ScreenAction::Switch(SwitchAction::Session {
                             target: session_name,
@@ -1488,6 +1488,13 @@ impl SessionListScreen {
     }
 }
 
+/// Rows a status message needs when wrapped to `width`, capped so a runaway
+/// message can't push the table off screen.
+fn wrapped_height(msg: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    (msg.chars().count().div_ceil(width) as u16).clamp(1, 6)
+}
+
 impl ScreenBehavior for SessionListScreen {
     fn tick(&mut self, manager: &mut Manager) -> ScreenAction {
         let action = self.apply_review_results(manager);
@@ -1510,9 +1517,11 @@ impl ScreenBehavior for SessionListScreen {
         let filter_height = if has_filter { 1 } else { 0 };
 
         let status_height = match &self.inline_mode {
-            InlineMode::None => {
-                if self.status_message.is_some() || self.reviewing() { 1 } else { 0 }
-            }
+            InlineMode::None => match &self.status_message {
+                Some(msg) => wrapped_height(msg, area.width),
+                None if self.reviewing() => 1,
+                None => 0,
+            },
             InlineMode::Working { .. } => 0,
             _ => 1,
         };
@@ -1582,7 +1591,8 @@ impl ScreenBehavior for SessionListScreen {
             InlineMode::None => {
                 if let Some(ref msg) = self.status_message {
                     let status = Paragraph::new(msg.as_str())
-                        .style(Style::default().fg(theme::TEXT_DIM).bg(theme::BG));
+                        .style(Style::default().fg(theme::TEXT_DIM).bg(theme::BG))
+                        .wrap(Wrap { trim: false });
                     f.render_widget(status, chunks[2]);
                 }
             }
@@ -1902,6 +1912,18 @@ impl ScreenBehavior for SessionListScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_height_fits_the_message_within_bounds() {
+        for (len, width) in [(0usize, 80u16), (1, 80), (80, 80), (81, 80), (10_000, 80), (5, 0)] {
+            let msg = "x".repeat(len);
+            let h = wrapped_height(&msg, width);
+            assert!((1..=6).contains(&h));
+            if len > 0 && len <= 6 * width.max(1) as usize {
+                assert!(h as usize * width.max(1) as usize >= len);
+            }
+        }
+    }
 
     fn session(id: Option<i64>, name: &str) -> SessionInfo {
         SessionInfo {

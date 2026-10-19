@@ -8,6 +8,7 @@ pub mod help;
 pub mod new_session;
 pub mod adopt_session;
 pub mod adopt_worktree;
+pub mod path_complete;
 pub mod rename;
 pub mod edit_branch;
 pub mod cleanup;
