@@ -16,7 +16,7 @@ use crate::utils::utc_now;
 
 /// Default tmux layout: (window_name, optional command to send).
 const DEFAULT_LAYOUT: &[(&str, Option<&str>)] = &[
-    ("claude", Some("claude")),
+    ("claude", None),
     ("shell", None),
 ];
 
@@ -73,13 +73,11 @@ fn filter_orphans(
 /// The first layout entry becomes the session's initial window — named at
 /// `tmux new-session` time via `-n`, so we don't depend on tmux's
 /// configurable `base-index`. Subsequent entries become additional windows.
-pub fn apply_layout(session_name: &str, working_dir: &str) -> Result<(), tmux::TmuxError> {
-    let (first_name, first_command) = DEFAULT_LAYOUT[0];
+pub fn apply_layout(session_name: &str, working_dir: &str, claude_cmd: &str) -> Result<(), tmux::TmuxError> {
+    let (first_name, _) = DEFAULT_LAYOUT[0];
     tmux::new_session(session_name, working_dir, Some(first_name))?;
-    if let Some(cmd) = first_command {
-        let target = format!("{}:{}", session_name, first_name);
-        tmux::send_keys(&target, &[cmd, "Enter"]);
-    }
+    let target = format!("{}:{}", session_name, first_name);
+    tmux::send_keys(&target, &[claude_cmd, "Enter"]);
 
     for &(name, command) in &DEFAULT_LAYOUT[1..] {
         let _ = tmux::new_window(session_name, name, Some(working_dir));
@@ -264,7 +262,10 @@ impl Manager {
             return Err(format!("path '{}' no longer exists", wt_path));
         }
 
-        apply_layout(&session.name, &wt_path)
+        let claude_cmd = crate::claude_pane::find_latest_conversation(Path::new(&wt_path))
+            .map(|id| format!("claude --resume {}", id))
+            .unwrap_or_else(|| "claude".to_string());
+        apply_layout(&session.name, &wt_path, &claude_cmd)
             .map_err(|e| format!("Failed to create tmux session: {}", e))?;
         Ok(())
     }
@@ -284,7 +285,7 @@ impl Manager {
         }
 
         // tmux first — fail loudly before touching the DB.
-        apply_layout(&session_name, wt_path)
+        apply_layout(&session_name, wt_path, "claude")
             .map_err(|e| format!("Failed to create tmux session: {}", e))?;
 
         let session = db::add_session(
@@ -423,7 +424,7 @@ impl Manager {
         };
 
         // tmux first — fail loudly before touching the DB.
-        apply_layout(&chosen_name, &effective_dir)
+        apply_layout(&chosen_name, &effective_dir, "claude")
             .map_err(|e| format!("Failed to create tmux session: {}", e))?;
 
         let session = db::add_session(
@@ -591,7 +592,7 @@ impl Manager {
         branch: &str,
         session_name: &str,
     ) -> Result<Session, String> {
-        apply_layout(session_name, path)
+        apply_layout(session_name, path, "claude")
             .map_err(|e| format!("Failed to create tmux session: {}", e))?;
         Ok(self.persist_adopted_worktree(repo_id, path, branch, session_name))
     }
@@ -1375,7 +1376,7 @@ mod reuse_tests {
         let session_name = format!("trellistest-layout-{}", std::process::id());
         let _guard = SessionGuard(session_name.clone());
 
-        apply_layout(&session_name, &tmp.path().to_string_lossy()).unwrap();
+        apply_layout(&session_name, &tmp.path().to_string_lossy(), "claude").unwrap();
         assert!(crate::tmux::session_exists(&session_name));
 
         let windows = crate::tmux::list_windows(&session_name);

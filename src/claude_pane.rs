@@ -129,6 +129,47 @@ pub fn classify_pane(pane_text: &str) -> &'static str {
     "idle"
 }
 
+/// Find the most-recent Claude conversation that ran in `cwd`.
+///
+/// Returns the bare conversation UUID (no `.jsonl` extension), or `None` if
+/// no prior conversation exists for this cwd or any I/O error prevents
+/// reading the projects directory.
+pub fn find_latest_conversation(cwd: &Path) -> Option<String> {
+    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    find_latest_conversation_in(&projects_dir, cwd)
+}
+
+/// Find the most-recent Claude conversation that ran in `cwd`, looking under
+/// `projects_dir/<encoded-cwd>/`. Returns the bare UUID (no `.jsonl` extension).
+///
+/// `projects_dir` is the `~/.claude/projects` location (parameterized for tests).
+fn find_latest_conversation_in(projects_dir: &Path, cwd: &Path) -> Option<String> {
+    let encoded = cwd.to_string_lossy().replace('/', "-");
+    let dir = projects_dir.join(&encoded);
+    let entries = fs::read_dir(&dir).ok()?;
+
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let mtime = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        match &best {
+            Some((best_mtime, _)) if mtime <= *best_mtime => {}
+            _ => best = Some((mtime, stem)),
+        }
+    }
+    best.map(|(_, stem)| stem)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +237,97 @@ mod tests {
         assert_eq!(classify_pane("✻ Baked for 2m 36s"), "idle");
         assert_eq!(classify_pane("✻ Cogitated for 43s"), "idle");
         assert_eq!(classify_pane("✻ Cooked for 3m 17s"), "idle");
+    }
+
+    #[test]
+    fn find_latest_returns_none_when_encoded_dir_missing() {
+        use tempfile::tempdir;
+        let projects = tempdir().unwrap();
+        // /nope/here doesn't have a corresponding encoded dir in projects/
+        let result = find_latest_conversation_in(projects.path(), Path::new("/nope/here"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_latest_returns_newest_jsonl_by_mtime() {
+        use std::fs::File;
+        use std::thread::sleep;
+        use std::time::Duration;
+        use tempfile::tempdir;
+
+        let projects = tempdir().unwrap();
+        // cwd we'll fake: /foo/bar -> encoded as "-foo-bar"
+        let cwd = Path::new("/foo/bar");
+        let encoded = projects.path().join("-foo-bar");
+        fs::create_dir_all(&encoded).unwrap();
+
+        // Create three jsonls with distinct mtimes by sleeping between creates.
+        // 10ms is enough on every filesystem we care about.
+        File::create(encoded.join("aaaa.jsonl")).unwrap();
+        sleep(Duration::from_millis(10));
+        File::create(encoded.join("bbbb.jsonl")).unwrap();
+        sleep(Duration::from_millis(10));
+        File::create(encoded.join("cccc.jsonl")).unwrap();
+        // Now touch bbbb to make IT the newest by mtime.
+        sleep(Duration::from_millis(10));
+        File::create(encoded.join("bbbb.jsonl")).unwrap();
+
+        let result = find_latest_conversation_in(projects.path(), cwd);
+        assert_eq!(result.as_deref(), Some("bbbb"));
+    }
+
+    #[test]
+    fn find_latest_ignores_non_jsonl_files() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::thread::sleep;
+        use std::time::Duration;
+        use tempfile::tempdir;
+
+        let projects = tempdir().unwrap();
+        let cwd = Path::new("/foo/bar");
+        let encoded = projects.path().join("-foo-bar");
+        fs::create_dir_all(&encoded).unwrap();
+
+        // Create the .jsonl FIRST, then a .txt later. If extension filtering were
+        // missing, the .txt's newer mtime would win and the result would be a
+        // bare stem ("notes") that doesn't match what we want.
+        File::create(encoded.join("real.jsonl")).unwrap();
+        sleep(Duration::from_millis(10));
+        let mut txt = File::create(encoded.join("notes.txt")).unwrap();
+        txt.write_all(b"distractor").unwrap();
+
+        let result = find_latest_conversation_in(projects.path(), cwd);
+        assert_eq!(result.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn find_latest_returns_none_when_dir_has_no_jsonl() {
+        use tempfile::tempdir;
+
+        let projects = tempdir().unwrap();
+        let cwd = Path::new("/foo/bar");
+        let encoded = projects.path().join("-foo-bar");
+        fs::create_dir_all(encoded.join("subagents")).unwrap();
+        // No .jsonl files at the top level.
+
+        let result = find_latest_conversation_in(projects.path(), cwd);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_latest_encoded_cwd_uses_dash_substitution() {
+        use std::fs::File;
+        use tempfile::tempdir;
+
+        let projects = tempdir().unwrap();
+        // Three-segment cwd to make the encoding non-trivial.
+        let cwd = Path::new("/a/b/c");
+        let expected_dir = projects.path().join("-a-b-c");
+        fs::create_dir_all(&expected_dir).unwrap();
+        File::create(expected_dir.join("only.jsonl")).unwrap();
+
+        let result = find_latest_conversation_in(projects.path(), cwd);
+        assert_eq!(result.as_deref(), Some("only"));
     }
 }
