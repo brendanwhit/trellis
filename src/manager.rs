@@ -290,10 +290,13 @@ impl Manager {
 
         // Existing DB row?
         if let Some(existing) = self.get_session_by_name(&session_name) {
-            if existing.repo_id == repo.id.unwrap() && tmux::session_exists(&session_name) {
-                return Ok(existing);
+            if tmux::session_exists(&session_name) {
+                if existing.repo_id == repo.id.unwrap() {
+                    return Ok(existing);
+                }
+                return Err(format!("Session '{}' is live for another repo", session_name));
             }
-            // Stale row — drop it.
+            // Dead row — drop it.
             if let Some(id) = existing.id {
                 self.delete_session(id, false)?;
             }
@@ -315,7 +318,13 @@ impl Manager {
             },
         );
 
-        if wt_path != repo.path && db::get_worktree_by_path(&self.conn, wt_path).is_none() {
+        // A worktree row left behind by a deleted session has session_id NULL;
+        // re-link it rather than inserting a duplicate.
+        if let Some(wt) = db::get_worktree_by_path(&self.conn, wt_path) {
+            if wt.session_id.is_none() {
+                db::link_worktree_to_session(&self.conn, wt.id.unwrap(), session.id.unwrap());
+            }
+        } else if wt_path != repo.path {
             db::add_worktree(
                 &self.conn,
                 &Worktree {
@@ -454,7 +463,11 @@ impl Manager {
             },
         );
 
-        if wt_path != repo.path && db::get_worktree_by_path(&self.conn, &wt_path).is_none() {
+        if let Some(wt) = db::get_worktree_by_path(&self.conn, &wt_path) {
+            if wt.session_id.is_none() {
+                db::link_worktree_to_session(&self.conn, wt.id.unwrap(), session.id.unwrap());
+            }
+        } else if wt_path != repo.path {
             db::add_worktree(
                 &self.conn,
                 &Worktree {

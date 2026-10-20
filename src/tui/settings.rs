@@ -235,7 +235,7 @@ impl ScreenBehavior for SettingsScreen {
         if let Event::Key(KeyEvent { code, kind: KeyEventKind::Press, modifiers, .. }) = event {
             match code {
                 KeyCode::Esc => return ScreenAction::Pop,
-                KeyCode::Enter => {
+                KeyCode::Enter if modifiers.is_empty() => {
                     self.save(manager);
                     return ScreenAction::None;
                 }

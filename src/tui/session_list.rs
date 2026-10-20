@@ -1010,9 +1010,9 @@ impl SessionListScreen {
                 }
             }
             "claude" if session.live => {
-                let _ = tmux::new_window(&session.name, "claude", None);
-                let target = format!("{}:claude", session.name);
-                tmux::send_keys(&target, &["claude", "Enter"]);
+                if let Ok(window_id) = tmux::new_window(&session.name, "claude", None) {
+                    tmux::send_keys(&window_id, &["claude", "Enter"]);
+                }
                 if session.managed {
                     if let Some(id) = session.id {
                         manager.touch_session(id);
