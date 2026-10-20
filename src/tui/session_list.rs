@@ -148,7 +148,7 @@ enum InlineMode {
     Working { action: ConfirmAction },
     Rename { input: String, cursor: usize, is_session: bool, session_id: Option<i64>, session_name: String, window_index: Option<i64> },
     Review { input: String, cursor: usize, repo_index: usize, repos: Vec<Repo> },
-    NewTab { input: String, cursor: usize, session_id: i64, session_name: String },
+    NewTab { input: String, cursor: usize, session_id: Option<i64>, session_name: String, plain: bool },
     ActionMenu { items: Vec<(String, String)>, cursor: usize },
 }
 
@@ -626,7 +626,8 @@ impl SessionListScreen {
         }
     }
 
-    fn handle_filter_key(&mut self, key: KeyCode, manager: &Manager) -> ScreenAction {
+    fn handle_filter_key(&mut self, key: KeyCode, modifiers: crossterm::event::KeyModifiers, manager: &Manager) -> ScreenAction {
+        use crossterm::event::KeyModifiers;
         match key {
             KeyCode::Esc => {
                 self.dismiss_filter(manager);
@@ -637,9 +638,26 @@ impl SessionListScreen {
                 self.filter_active = false;
                 ScreenAction::None
             }
+            KeyCode::Down => {
+                self.cursor_down();
+                ScreenAction::None
+            }
+            KeyCode::Up => {
+                self.cursor_up();
+                ScreenAction::None
+            }
             KeyCode::Backspace => {
                 self.filter.pop();
                 self.refresh(manager);
+                ScreenAction::None
+            }
+            KeyCode::Char(c) if modifiers.contains(KeyModifiers::CONTROL) => {
+                // Vim/Emacs-style nav while keeping the filter input focused.
+                match c {
+                    'j' | 'n' => self.cursor_down(),
+                    'k' | 'p' => self.cursor_up(),
+                    _ => {}
+                }
                 ScreenAction::None
             }
             KeyCode::Char(c) => {
@@ -675,8 +693,9 @@ impl SessionListScreen {
                                 self.inline_mode = InlineMode::NewTab {
                                     input: String::new(),
                                     cursor: 0,
-                                    session_id: s.id.unwrap(),
+                                    session_id: Some(s.id.unwrap()),
                                     session_name: s.name.clone(),
+                                    plain: false,
                                 };
                                 return ScreenAction::None;
                             }
@@ -691,10 +710,34 @@ impl SessionListScreen {
             self.inline_mode = InlineMode::NewTab {
                 input: String::new(),
                 cursor: 0,
-                session_id: id,
+                session_id: Some(id),
                 session_name: session.name.clone(),
+                plain: false,
             };
         }
+        ScreenAction::None
+    }
+
+    /// Open a plain tmux window (no worktree) in the focused session, rooted at
+    /// the active pane's cwd. Useful for ad-hoc helpers (extra claude tab,
+    /// REPL, log inspector) that share context with the current tab without
+    /// branching the repo.
+    fn action_new_plain_tab(&mut self, _manager: &Manager) -> ScreenAction {
+        let session = match self.current_session() {
+            Some(s) => s.clone(),
+            None => return ScreenAction::None,
+        };
+        if !session.live {
+            self.status_message = Some("Session must be live to add a tab.".to_string());
+            return ScreenAction::None;
+        }
+        self.inline_mode = InlineMode::NewTab {
+            input: String::new(),
+            cursor: 0,
+            session_id: session.id,
+            session_name: session.name.clone(),
+            plain: true,
+        };
         ScreenAction::None
     }
 
@@ -975,6 +1018,7 @@ impl SessionListScreen {
             ("h/l", "Collapse/Expand"),
             ("n", "New"),
             ("t", "Tab"),
+            ("T", "Plain tab"),
             ("r", "Rename"),
             ("R", "Review"),
             ("d", "Delete"),
@@ -1140,18 +1184,39 @@ impl SessionListScreen {
     fn handle_new_tab_key(&mut self, code: KeyCode, modifiers: crossterm::event::KeyModifiers, manager: &mut Manager) -> ScreenAction {
         match code {
             KeyCode::Enter => {
-                let (input, session_id, session_name) = match &self.inline_mode {
-                    InlineMode::NewTab { input, session_id, session_name, .. } => {
-                        (input.trim().to_string(), *session_id, session_name.clone())
+                let (input, session_id, session_name, plain) = match &self.inline_mode {
+                    InlineMode::NewTab { input, session_id, session_name, plain, .. } => {
+                        (input.trim().to_string(), *session_id, session_name.clone(), *plain)
                     }
                     _ => return ScreenAction::None,
                 };
+                if plain {
+                    let window_name = if input.is_empty() { "claude".to_string() } else { input.clone() };
+                    let cwd = tmux::session_active_pane_path(&session_name);
+                    self.inline_mode = InlineMode::None;
+                    if let Err(e) = tmux::new_window(&session_name, &window_name, cwd.as_deref()) {
+                        self.status_message = Some(format!("Error: {}", e));
+                        return ScreenAction::None;
+                    }
+                    tmux::send_keys(
+                        &format!("{}:{}", session_name, window_name),
+                        &["claude", "Enter"],
+                    );
+                    return ScreenAction::Switch(SwitchAction::Session { target: session_name });
+                }
                 if input.is_empty() {
                     self.status_message = Some("Branch name cannot be empty.".to_string());
                     return ScreenAction::None;
                 }
+                let id = match session_id {
+                    Some(id) => id,
+                    None => {
+                        self.status_message = Some("Worktree tabs require a managed session.".to_string());
+                        return ScreenAction::None;
+                    }
+                };
                 self.inline_mode = InlineMode::None;
-                match manager.add_tab(session_id, &input) {
+                match manager.add_tab(id, &input) {
                     Ok(_) => {
                         tmux::send_keys(
                             &format!("{}:{}", session_name, input),
@@ -1393,8 +1458,12 @@ impl ScreenBehavior for SessionListScreen {
                 let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG));
                 f.render_widget(status, chunks[2]);
             }
-            InlineMode::NewTab { ref input, cursor: cursor_pos, ref session_name, .. } => {
-                let prefix = format!("New tab in '{}': ", session_name);
+            InlineMode::NewTab { ref input, cursor: cursor_pos, ref session_name, plain, .. } => {
+                let prefix = if *plain {
+                    format!("Plain tab in '{}' (name, default 'claude'): ", session_name)
+                } else {
+                    format!("New tab in '{}': ", session_name)
+                };
                 let suffix = "  [enter] create  [esc] cancel";
 
                 let before = &input[..*cursor_pos];
@@ -1533,7 +1602,7 @@ impl ScreenBehavior for SessionListScreen {
 
         // If filter is active, handle filter-specific keys
         if self.filter_active {
-            return self.handle_filter_key(*code, manager);
+            return self.handle_filter_key(*code, *modifiers, manager);
         }
 
         // Clear status message on any normal key action
@@ -1576,6 +1645,7 @@ impl ScreenBehavior for SessionListScreen {
                 ScreenAction::Push(Box::new(screen))
             }
             KeyCode::Char('t') => self.action_new_tab(manager),
+            KeyCode::Char('T') => self.action_new_plain_tab(manager),
             KeyCode::Char('r') => self.action_rename(manager),
             KeyCode::Char('R') => self.action_review(manager),
             KeyCode::Char('d') => self.action_delete(manager),

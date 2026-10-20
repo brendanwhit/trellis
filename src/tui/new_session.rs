@@ -649,6 +649,17 @@ impl ScreenBehavior for NewSessionScreen {
                     }
                     return ScreenAction::None;
                 }
+                KeyCode::Char(c) if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                    // Vim/Emacs-style nav while filter input has focus.
+                    if !self.awaiting_repo_path {
+                        match c {
+                            'j' | 'n' => self.move_selection(1),
+                            'k' | 'p' => self.move_selection(-1),
+                            _ => {}
+                        }
+                    }
+                    return ScreenAction::None;
+                }
                 _ => {
                     // Text input for filter
                     input_handle_key(&mut self.filter_input, &mut self.filter_cursor, *code, *modifiers);
