@@ -96,16 +96,25 @@ impl HistoryScreen {
             entries.to_vec()
         } else {
             let q = &self.filter;
-            entries
+            let mut scored: Vec<(Conversation, i32)> = entries
                 .iter()
-                .filter(|e| {
-                    e.date.to_lowercase().contains(q)
-                        || e.project.to_lowercase().contains(q)
-                        || e.branch.to_lowercase().contains(q)
-                        || e.summary().to_lowercase().contains(q)
+                .filter_map(|e| {
+                    // Conversation::summary returns &str (see src/models.rs).
+                    let candidates: [&str; 4] = [&e.date, &e.project, &e.branch, e.summary()];
+                    let best = candidates
+                        .iter()
+                        .filter_map(|c| crate::fuzzy::fuzzy_match_multi(q, c))
+                        .min();
+                    best.map(|score| (e.clone(), score))
                 })
-                .cloned()
-                .collect()
+                .collect();
+            scored.sort_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| a.0.project.to_lowercase().cmp(&b.0.project.to_lowercase()))
+                    .then_with(|| a.0.branch.to_lowercase().cmp(&b.0.branch.to_lowercase()))
+                    .then_with(|| a.0.date.cmp(&b.0.date))
+            });
+            scored.into_iter().map(|(e, _)| e).collect()
         };
 
         let mut sorted = filtered;

@@ -34,6 +34,27 @@ pub fn fuzzy_match(query: &str, text: &str) -> Option<i32> {
     }
 }
 
+/// Like `fuzzy_match`, but splits `query` on whitespace into tokens and
+/// requires every token to match `text` as a subsequence independently
+/// (fzf-style "AND" semantics). Each token matches in order within itself;
+/// order between tokens doesn't matter. Returns the sum of per-token scores,
+/// or `None` if any token fails to match. Empty or all-whitespace query
+/// returns `Some(0)`.
+pub fn fuzzy_match_multi(query: &str, text: &str) -> Option<i32> {
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Some(0);
+    }
+    let mut total = 0i32;
+    for token in tokens {
+        match fuzzy_match(token, text) {
+            Some(s) => total += s,
+            None => return None,
+        }
+    }
+    Some(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +94,36 @@ mod tests {
         let close = fuzzy_match("ab", "ab___").unwrap();
         let far = fuzzy_match("ab", "a___b").unwrap();
         assert!(close < far);
+    }
+
+    #[test]
+    fn multi_tokens_must_all_match() {
+        assert!(fuzzy_match_multi("feat dup", "feat/duplicate-x").is_some());
+    }
+
+    #[test]
+    fn multi_returns_none_if_any_token_missing() {
+        assert_eq!(fuzzy_match_multi("feat xyz", "feat/duplicate-x"), None);
+    }
+
+    #[test]
+    fn multi_empty_or_whitespace_returns_zero() {
+        assert_eq!(fuzzy_match_multi("", "anything"), Some(0));
+        assert_eq!(fuzzy_match_multi("   ", "anything"), Some(0));
+    }
+
+    #[test]
+    fn multi_single_token_equals_fuzzy_match() {
+        let a = fuzzy_match("feat", "feature-branch").unwrap();
+        let b = fuzzy_match_multi("feat", "feature-branch").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn multi_literal_space_in_query_no_longer_blocks_match() {
+        // The bug this fix addresses: plain fuzzy_match fails on a literal
+        // space character. fuzzy_match_multi splits on whitespace and succeeds.
+        assert_eq!(fuzzy_match("feat dup", "feat/duplicate-x"), None);
+        assert!(fuzzy_match_multi("feat dup", "feat/duplicate-x").is_some());
     }
 }

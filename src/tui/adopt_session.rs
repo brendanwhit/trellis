@@ -161,31 +161,40 @@ impl AdoptSessionScreen {
     // ------------------------------------------------------------------
 
     fn apply_filter(&mut self) {
-        let query = self.filter_input.to_lowercase();
+        let query = self.filter_input.clone();
         match self.step {
             Step::PickRepo => {
-                self.filtered_repos = self
+                let mut scored: Vec<(usize, i32)> = self
                     .repos
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| {
-                        r.name.to_lowercase().contains(&query)
-                            || r.path.to_lowercase().contains(&query)
+                    .filter_map(|(i, r)| {
+                        let best = [r.name.as_str(), r.path.as_str()]
+                            .iter()
+                            .filter_map(|c| crate::fuzzy::fuzzy_match_multi(&query, c))
+                            .min();
+                        best.map(|score| (i, score))
                     })
-                    .map(|(i, _)| i)
                     .collect();
+                scored.sort_by(|a, b| {
+                    a.1.cmp(&b.1).then_with(|| {
+                        self.repos[a.0].name.to_lowercase().cmp(&self.repos[b.0].name.to_lowercase())
+                    })
+                });
+                self.filtered_repos = scored.into_iter().map(|(i, _)| i).collect();
                 self.repo_list_state = ListState::default();
                 if !self.filtered_repos.is_empty() {
                     self.repo_list_state.select(Some(0));
                 }
             }
             Step::PickBranch => {
-                self.filtered_branches = self
+                let mut scored: Vec<(String, i32)> = self
                     .branches
                     .iter()
-                    .filter(|b| b.to_lowercase().contains(&query))
-                    .cloned()
+                    .filter_map(|b| crate::fuzzy::fuzzy_match_multi(&query, b).map(|s| (b.clone(), s)))
                     .collect();
+                scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+                self.filtered_branches = scored.into_iter().map(|(b, _)| b).collect();
                 self.branch_list_state = ListState::default();
                 if !self.filtered_branches.is_empty() {
                     self.branch_list_state.select(Some(0));
