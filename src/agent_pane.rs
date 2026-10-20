@@ -15,12 +15,17 @@
 // Claude Code needs no extension: it publishes the same facts itself in
 // `~/.claude/sessions/<pid>.json` (undocumented schema; `status` is
 // busy/waiting/idle and `tmux` is `session:@win.%pane`). `read_status` falls
-// back to that when a pane has no trellis status file.
+// back to that when a pane has no trellis status file. Claude reports a
+// question asked in plain text as `idle`, so an idle Claude pane is upgraded to
+// `prompting` when its screen shows the last reply ending in `?`
+// (`asked_question`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::tmux;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaneStatus {
@@ -48,7 +53,111 @@ fn claude_sessions_dir() -> PathBuf {
 /// Read the status for a tmux pane id (`%12`). `None` when the pane is not an
 /// agent pane, the file is malformed, or the writer is no longer alive.
 pub fn read_status(pane_id: &str) -> Option<PaneStatus> {
-    read_status_in(pane_id, &status_dir(), &claude_sessions_dir())
+    let status = read_status_in(pane_id, &status_dir(), &claude_sessions_dir())?;
+    Some(upgrade_if_asked_question(status, || tmux::capture_pane(pane_id, SCREEN_LINES)))
+}
+
+/// Claude's session file calls a plain-text question `idle`; promote it to
+/// `prompting` when the pane's screen (read only for idle Claude panes) shows one.
+fn upgrade_if_asked_question(
+    mut status: PaneStatus,
+    screen: impl FnOnce() -> Option<String>,
+) -> PaneStatus {
+    if status.agent == "claude" && status.state == "idle" && screen().is_some_and(|s| asked_question(&s)) {
+        status.state = "prompting".to_string();
+    }
+    status
+}
+
+/// Enough scrollback to reach the last reply and the "Cooked for 3s" line below it.
+const SCREEN_LINES: u32 = 40;
+
+/// Whether an idle Claude Code screen ends with the assistant asking a question
+/// in prose. Anchors on the "✻ Cooked for 3s" line Claude prints when a turn
+/// ends, then checks that the nearest line of reply text above it ends in `?`
+/// and that nothing has started a new turn below it.
+fn asked_question(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    let Some(idle_at) = lines.iter().rposition(|l| is_turn_end_marker(l)) else {
+        return false;
+    };
+
+    // A typed prompt, tool output or a tool call below the marker means a newer
+    // turn has begun and the question is stale.
+    let new_turn_below = lines[idle_at + 1..].iter().map(|l| l.trim()).any(|l| {
+        (l.starts_with('❯') && !l.trim_start_matches('❯').trim().is_empty())
+            || l.starts_with('⎿')
+            || is_tool_call(l)
+    });
+    if new_turn_below {
+        return false;
+    }
+
+    lines[..idle_at]
+        .iter()
+        .rev()
+        .find(|l| !is_chrome(l))
+        .is_some_and(|l| l.trim_end().ends_with('?'))
+}
+
+/// "✻ Cooked for 3s", "✻ Worked for 1m 22s", "✻ Thought for 10s".
+fn is_turn_end_marker(line: &str) -> bool {
+    fn parse(line: &str) -> Option<()> {
+        let mut chars = line.trim_start().chars();
+        if chars.next()?.is_ascii() {
+            return None;
+        }
+        let rest = chars.as_str();
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let mut words = rest.split_whitespace();
+        let verb = words.next()?;
+        let past_tense = verb.len() > 2
+            && verb.ends_with("ed")
+            && verb.chars().all(|c| c.is_alphanumeric() || c == '_');
+        if !(verb == "Thought" || past_tense) || words.next()? != "for" {
+            return None;
+        }
+        let amount = words.next()?;
+        let digits = amount.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let unit = match &amount[digits..] {
+            "" => words.next()?,
+            attached => attached,
+        };
+        matches!(unit.chars().next()?, 'h' | 'm' | 's').then_some(())
+    }
+    parse(line).is_some()
+}
+
+/// "⏺ Bash(ls)": a glyph, then a tool name and its argument list.
+fn is_tool_call(line: &str) -> bool {
+    let mut chars = line.chars();
+    if chars.next().is_none_or(|c| c.is_ascii()) {
+        return false;
+    }
+    let rest = chars.as_str();
+    if !rest.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let name: String = rest.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    !name.is_empty() && rest.trim_start()[name.len()..].starts_with('(')
+}
+
+/// Screen furniture that can sit between a reply and its turn-end marker:
+/// input-box rules, the prompt, the mode line, and live spinner rows.
+fn is_chrome(line: &str) -> bool {
+    let s = line.trim();
+    if s.starts_with(['─', '❯', '⏵']) {
+        return true;
+    }
+    // "✻ Thinking…": glyph, then text up to an ellipsis with no "(" before it.
+    let mut chars = s.chars();
+    let glyph_then_space = chars.next().is_some_and(|c| !c.is_ascii()) && chars.as_str().starts_with(char::is_whitespace);
+    glyph_then_space && chars.as_str().trim_start().split_once('…').is_some_and(|(phrase, _)| !phrase.is_empty() && !phrase.contains('('))
 }
 
 fn read_status_in(pane_id: &str, trellis_dir: &Path, claude_dir: &Path) -> Option<PaneStatus> {
@@ -255,5 +364,83 @@ mod tests {
         fs::remove_file(trellis.path().join("9.json")).unwrap();
         let got = read_status_in("%9", trellis.path(), claude.path()).unwrap();
         assert_eq!((got.agent.as_str(), got.state.as_str()), ("claude", "working"));
+    }
+
+    const QUESTION: &str = "\
+❯ Without using any tools, ask me in plain text what my favorite color is.
+
+⏺ What's your favorite color?
+
+✻ Cooked for 1s
+
+────────────────────────────────────────
+❯ 
+────────────────────────────────────────
+  -- INSERT -- ⏸ manual mode on
+";
+
+    #[test]
+    fn asked_question_detects_a_reply_ending_in_a_question_mark() {
+        assert!(asked_question(QUESTION));
+    }
+
+    #[test]
+    fn asked_question_ignores_a_finished_reply() {
+        let done = QUESTION.replace("What's your favorite color?", "I haven't done either.");
+        assert!(!asked_question(&done));
+    }
+
+    #[test]
+    fn asked_question_needs_the_turn_end_marker() {
+        let working = QUESTION.replace("✻ Cooked for 1s", "✻ Cooking… (3s)");
+        assert!(!asked_question(&working));
+        assert!(!asked_question(""));
+    }
+
+    #[test]
+    fn asked_question_goes_stale_once_a_new_turn_starts_below_the_marker() {
+        for next in ["❯ red", "⏺ Bash(ls)", "  ⎿  done"] {
+            let screen = QUESTION.replace("────────────────────────────────────────\n❯ \n", &format!("{}\n❯ \n", next));
+            assert!(!asked_question(&screen), "{next}");
+        }
+    }
+
+    #[test]
+    fn asked_question_looks_through_spinner_rows_and_recaps_below_the_marker() {
+        let screen = QUESTION.replace(
+            "✻ Cooked for 1s\n",
+            "✻ Cooked for 1m 22s · done 12:16 PM\n※ recap: waiting for you to pick (a) or (b).\n",
+        );
+        assert!(asked_question(&screen));
+    }
+
+    #[test]
+    fn turn_end_marker_accepts_claude_verbs_and_units() {
+        for ok in ["✻ Brewed for 31s", "✻ Worked for 22s · done 12:12 PM", "✻ Thought for 10 s", "✻ Crunched for 3m 57s"] {
+            assert!(is_turn_end_marker(ok), "{ok}");
+        }
+        for bad in ["Cooked for 1s", "✻ Cooking for 1s", "✻ Cooked for s", "✻ Cooked after 1s"] {
+            assert!(!is_turn_end_marker(bad), "{bad}");
+        }
+    }
+
+    fn status(agent: &str, state: &str) -> PaneStatus {
+        PaneStatus { agent: agent.into(), pid: 1, state: state.into(), title: None }
+    }
+
+    #[test]
+    fn idle_claude_asking_a_question_becomes_prompting() {
+        let got = upgrade_if_asked_question(status("claude", "idle"), || Some(QUESTION.to_string()));
+        assert_eq!(got.state, "prompting");
+    }
+
+    #[test]
+    fn only_idle_claude_panes_are_upgraded_and_only_those_read_the_screen() {
+        for (agent, state) in [("claude", "working"), ("claude", "prompting"), ("pi", "idle")] {
+            let got = upgrade_if_asked_question(status(agent, state), || panic!("screen read for {agent}/{state}"));
+            assert_eq!(got.state, state);
+        }
+        let got = upgrade_if_asked_question(status("claude", "idle"), || None);
+        assert_eq!(got.state, "idle");
     }
 }
