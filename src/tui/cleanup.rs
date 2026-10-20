@@ -9,61 +9,108 @@ use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
 
 use crate::git;
 use crate::manager::Manager;
-use crate::models::Worktree;
 use crate::utils::truncate_start;
 
 use super::confirm::ConfirmScreen;
 use super::theme;
 use super::{ActionResult, ScreenAction, ScreenBehavior};
 
+#[derive(Clone)]
+enum RowSource {
+    /// Worktree Trellis tracks in its DB.
+    Tracked { wt_id: i64 },
+    /// Worktree git knows about but Trellis doesn't (created out-of-band, or
+    /// its DB row was lost).
+    Orphan,
+}
+
 struct WorktreeRow {
-    wt_id: i64,
+    source: RowSource,
     branch: String,
     session_name: String,
     path: String,
+    /// The owning repo's working tree, used both for `git worktree remove` on
+    /// orphans and for the staleness check.
+    repo_path: String,
+    repo_default_branch: String,
     stale: Option<bool>, // None = still checking
+}
+
+/// Inputs the staleness worker needs per row. Lives across the thread
+/// boundary, so it owns its strings.
+struct StaleCheckInput {
+    path: String,
+    repo_path: String,
+    branch: String,
+    default_branch: String,
 }
 
 pub struct CleanupScreen {
     rows: Vec<WorktreeRow>,
-    selected: HashSet<i64>,
+    /// Selected rows, keyed by worktree path. Path is unique across both
+    /// tracked and orphan rows, so it works as a stable identity for either.
+    selected: HashSet<String>,
     table_state: TableState,
     error_message: Option<String>,
-    pending_delete: bool,
-    stale_rx: Option<mpsc::Receiver<HashSet<i64>>>,
+    /// True between confirming a delete and the tick that runs it. Drives the
+    /// "Working…" overlay so the user sees something during the (potentially
+    /// slow) `git worktree remove` calls instead of a frozen confirm modal.
+    working: bool,
+    stale_rx: Option<mpsc::Receiver<HashSet<String>>>,
 }
 
 impl CleanupScreen {
     pub fn new(manager: &Manager) -> Self {
-        let worktrees = manager.get_all_worktrees();
+        let tracked = manager.get_all_worktrees();
+        let orphans = manager.list_orphan_worktrees();
         let sessions = manager.get_sessions();
+        let repos = manager.get_repos();
 
-        // Build session name lookup: session_id -> session name
         let session_map: HashMap<i64, String> = sessions
             .into_iter()
             .filter_map(|s| s.id.map(|id| (id, s.name.clone())))
             .collect();
-
-        // Build rows immediately with stale=None (checking)
-        let mut rows: Vec<WorktreeRow> = worktrees
-            .iter()
-            .filter_map(|wt| {
-                let wt_id = wt.id?;
-                let session_name = wt
-                    .session_id
-                    .and_then(|sid| session_map.get(&sid).cloned())
-                    .unwrap_or_else(|| "Unattached".to_string());
-                Some(WorktreeRow {
-                    wt_id,
-                    branch: wt.branch.clone(),
-                    session_name,
-                    path: wt.path.clone(),
-                    stale: None, // checking in background
-                })
-            })
+        let repo_map: HashMap<i64, crate::models::Repo> = repos
+            .into_iter()
+            .filter_map(|r| r.id.map(|id| (id, r)))
             .collect();
 
-        // Sort by session name then branch
+        let mut rows: Vec<WorktreeRow> = Vec::new();
+
+        // DB-tracked worktrees
+        for wt in &tracked {
+            let Some(wt_id) = wt.id else { continue };
+            let Some(repo) = repo_map.get(&wt.repo_id) else { continue };
+            let session_name = wt
+                .session_id
+                .and_then(|sid| session_map.get(&sid).cloned())
+                .unwrap_or_else(|| "Unattached".to_string());
+            rows.push(WorktreeRow {
+                source: RowSource::Tracked { wt_id },
+                branch: wt.branch.clone(),
+                session_name,
+                path: wt.path.clone(),
+                repo_path: repo.path.clone(),
+                repo_default_branch: repo.default_branch.clone(),
+                stale: None,
+            });
+        }
+
+        // Worktrees git knows about but Trellis doesn't.
+        // `list_orphan_worktrees` already excludes the main worktree, missing
+        // dirs, detached HEAD, and paths Trellis already tracks.
+        for orphan in &orphans {
+            rows.push(WorktreeRow {
+                source: RowSource::Orphan,
+                branch: orphan.branch.clone(),
+                session_name: "(orphan)".to_string(),
+                path: orphan.path.clone(),
+                repo_path: orphan.repo.path.clone(),
+                repo_default_branch: orphan.repo.default_branch.clone(),
+                stale: None,
+            });
+        }
+
         rows.sort_by(|a, b| {
             a.session_name
                 .to_lowercase()
@@ -76,28 +123,34 @@ impl CleanupScreen {
             table_state.select(Some(0));
         }
 
-        // Spawn background thread for staleness check
+        // Spawn background thread for staleness check. Hand it owned data
+        // rather than database handles so it can outlive `manager`.
+        let inputs: Vec<StaleCheckInput> = rows
+            .iter()
+            .map(|r| StaleCheckInput {
+                path: r.path.clone(),
+                repo_path: r.repo_path.clone(),
+                branch: r.branch.clone(),
+                default_branch: r.repo_default_branch.clone(),
+            })
+            .collect();
         let (tx, rx) = mpsc::channel();
-        let owned_worktrees: Vec<Worktree> = worktrees;
-        let repos = manager.get_repos();
         std::thread::spawn(move || {
-            let repo_map: HashMap<i64, crate::models::Repo> = repos
-                .into_iter()
-                .filter_map(|r| r.id.map(|id| (id, r)))
-                .collect();
-            let mut stale_ids = HashSet::new();
-            for wt in &owned_worktrees {
-                let Some(wt_id) = wt.id else { continue };
-                let Some(repo) = repo_map.get(&wt.repo_id) else { continue };
-                let merged = git::is_branch_merged(&repo.path, &wt.branch, &repo.default_branch)
-                    .unwrap_or(false);
-                let has_remote = git::has_remote_branch(&repo.path, &wt.branch)
+            let mut stale_paths = HashSet::new();
+            for input in &inputs {
+                let merged = git::is_branch_merged(
+                    &input.repo_path,
+                    &input.branch,
+                    &input.default_branch,
+                )
+                .unwrap_or(false);
+                let has_remote = git::has_remote_branch(&input.repo_path, &input.branch)
                     .unwrap_or(true);
                 if merged || !has_remote {
-                    stale_ids.insert(wt_id);
+                    stale_paths.insert(input.path.clone());
                 }
             }
-            let _ = tx.send(stale_ids);
+            let _ = tx.send(stale_paths);
         });
 
         Self {
@@ -105,16 +158,16 @@ impl CleanupScreen {
             selected: HashSet::new(),
             table_state,
             error_message: None,
-            pending_delete: false,
+            working: false,
             stale_rx: Some(rx),
         }
     }
 
     fn check_stale_results(&mut self) {
         if let Some(ref rx) = self.stale_rx {
-            if let Ok(stale_ids) = rx.try_recv() {
+            if let Ok(stale_paths) = rx.try_recv() {
                 for row in &mut self.rows {
-                    row.stale = Some(stale_ids.contains(&row.wt_id));
+                    row.stale = Some(stale_paths.contains(&row.path));
                 }
                 self.stale_rx = None;
             }
@@ -134,9 +187,9 @@ impl CleanupScreen {
     fn toggle_current(&mut self) {
         if let Some(idx) = self.table_state.selected() {
             if idx < self.rows.len() {
-                let wt_id = self.rows[idx].wt_id;
-                if !self.selected.remove(&wt_id) {
-                    self.selected.insert(wt_id);
+                let path = self.rows[idx].path.clone();
+                if !self.selected.remove(&path) {
+                    self.selected.insert(path);
                 }
             }
         }
@@ -144,7 +197,7 @@ impl CleanupScreen {
 
     fn select_all(&mut self) {
         for row in &self.rows {
-            self.selected.insert(row.wt_id);
+            self.selected.insert(row.path.clone());
         }
     }
 
@@ -180,21 +233,41 @@ impl CleanupScreen {
     }
 
     fn perform_delete(&mut self, manager: &mut Manager) {
-        let ids_to_delete: Vec<i64> = self.selected.iter().copied().collect();
+        // Snapshot the rows to delete up-front: source + paths the user
+        // selected. We mutate `self.rows` and `self.selected` as we go.
+        let targets: Vec<(String, RowSource)> = self
+            .rows
+            .iter()
+            .filter(|r| self.selected.contains(&r.path))
+            .map(|r| (r.path.clone(), r.source.clone()))
+            .collect();
         let mut errors = Vec::new();
 
-        for wt_id in &ids_to_delete {
-            if let Err(e) = manager.cleanup_worktree(*wt_id) {
-                errors.push(format!("worktree {}: {}", wt_id, e));
-            } else {
-                self.rows.retain(|r| r.wt_id != *wt_id);
-            }
-        }
-
-        // Remove successfully deleted from selection
-        for row_id in &ids_to_delete {
-            if !errors.iter().any(|e| e.starts_with(&format!("worktree {}:", row_id))) {
-                self.selected.remove(row_id);
+        for (path, source) in targets {
+            let result = match source {
+                RowSource::Tracked { wt_id } => manager.cleanup_worktree(wt_id),
+                RowSource::Orphan => {
+                    // Find the repo path the row remembers; if the row was
+                    // somehow already removed, skip.
+                    let repo_path = self
+                        .rows
+                        .iter()
+                        .find(|r| r.path == path)
+                        .map(|r| r.repo_path.clone());
+                    match repo_path {
+                        Some(rp) => git::remove_worktree(&rp, &path).map_err(|e| e.to_string()),
+                        None => Err("row missing".to_string()),
+                    }
+                }
+            };
+            match result {
+                Ok(()) => {
+                    self.rows.retain(|r| r.path != path);
+                    self.selected.remove(&path);
+                }
+                Err(e) => {
+                    errors.push(format!("{}: {}", path, e));
+                }
             }
         }
 
@@ -214,8 +287,6 @@ impl CleanupScreen {
         } else {
             self.table_state.select(None);
         }
-
-        self.pending_delete = false;
     }
 
     fn render_footer(&self) -> Paragraph<'_> {
@@ -231,8 +302,14 @@ impl CleanupScreen {
 }
 
 impl ScreenBehavior for CleanupScreen {
-    fn tick(&mut self, _manager: &mut Manager) -> ScreenAction {
+    fn tick(&mut self, manager: &mut Manager) -> ScreenAction {
         self.check_stale_results();
+        if self.working {
+            // The previous frame already painted the "Working…" overlay (draw
+            // runs before tick in the main loop), so blocking here is fine.
+            self.perform_delete(manager);
+            self.working = false;
+        }
         ScreenAction::None
     }
 
@@ -286,7 +363,7 @@ impl ScreenBehavior for CleanupScreen {
             .rows
             .iter()
             .map(|row| {
-                let is_selected = self.selected.contains(&row.wt_id);
+                let is_selected = self.selected.contains(&row.path);
 
                 let checkbox = if is_selected {
                     Span::styled("[x]", Style::default().fg(theme::BLUE))
@@ -339,11 +416,21 @@ impl ScreenBehavior for CleanupScreen {
         // Footer
         let footer = self.render_footer();
         f.render_widget(footer, chunks[4]);
+
+        if self.working {
+            super::working::render_overlay(f, area, "Deleting worktrees");
+        }
     }
 
     fn handle_event(&mut self, event: &Event, _manager: &mut Manager) -> ScreenAction {
         // Always check for background staleness results (even on non-key events)
         self.check_stale_results();
+
+        // Drop any input that arrives while a delete is running so a queued
+        // keypress can't trigger a follow-up action mid-operation.
+        if self.working {
+            return ScreenAction::None;
+        }
 
         let Event::Key(KeyEvent {
             code,
@@ -382,7 +469,6 @@ impl ScreenBehavior for CleanupScreen {
                     return ScreenAction::None;
                 }
                 let count = self.selected.len();
-                self.pending_delete = true;
                 ScreenAction::Push(Box::new(ConfirmScreen::new(
                     "Confirm Deletion".to_string(),
                     format!("Delete {} worktree(s)?", count),
@@ -392,13 +478,12 @@ impl ScreenBehavior for CleanupScreen {
         }
     }
 
-    fn on_child_result(&mut self, result: ActionResult, manager: &mut Manager) -> ScreenAction {
+    fn on_child_result(&mut self, result: ActionResult, _manager: &mut Manager) -> ScreenAction {
         if let ActionResult::Confirmed(true) = result {
-            if self.pending_delete {
-                self.perform_delete(manager);
-            }
-        } else {
-            self.pending_delete = false;
+            // Defer the actual delete to the next tick so the "Working…"
+            // overlay (rendered while `working` is true) lands before the
+            // blocking `git worktree remove` calls start.
+            self.working = true;
         }
         ScreenAction::None
     }
