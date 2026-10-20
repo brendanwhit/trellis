@@ -1194,14 +1194,14 @@ impl SessionListScreen {
                     let window_name = if input.is_empty() { "claude".to_string() } else { input.clone() };
                     let cwd = tmux::session_active_pane_path(&session_name);
                     self.inline_mode = InlineMode::None;
-                    if let Err(e) = tmux::new_window(&session_name, &window_name, cwd.as_deref()) {
-                        self.status_message = Some(format!("Error: {}", e));
-                        return ScreenAction::None;
-                    }
-                    tmux::send_keys(
-                        &format!("{}:{}", session_name, window_name),
-                        &["claude", "Enter"],
-                    );
+                    let window_id = match tmux::new_window(&session_name, &window_name, cwd.as_deref()) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                self.status_message = Some(format!("Error: {}", e));
+                                return ScreenAction::None;
+                            }
+                        };
+                        tmux::send_keys(&window_id, &["claude", "Enter"]);
                     return ScreenAction::Switch(SwitchAction::Session { target: session_name });
                 }
                 if input.is_empty() {

@@ -126,8 +126,10 @@ pub fn session_active_pane_path(session: &str) -> Option<String> {
     if path.is_empty() { None } else { Some(path) }
 }
 
-pub fn new_window(session: &str, name: &str, start_dir: Option<&str>) -> Result<(), TmuxError> {
-    let mut args = vec!["new-window", "-t", session, "-n", name];
+/// Returns the new window's id (`@N`), which is the only target that stays
+/// unambiguous when another window in the session shares its name.
+pub fn new_window(session: &str, name: &str, start_dir: Option<&str>) -> Result<String, TmuxError> {
+    let mut args = vec!["new-window", "-t", session, "-n", name, "-P", "-F", "#{window_id}"];
     if let Some(dir) = start_dir {
         args.extend_from_slice(&["-c", dir]);
     }
@@ -140,7 +142,7 @@ pub fn new_window(session: &str, name: &str, start_dir: Option<&str>) -> Result<
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub fn select_window(session: &str, index: i64) -> Result<(), TmuxError> {

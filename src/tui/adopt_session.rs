@@ -502,8 +502,9 @@ impl ScreenBehavior for AdoptSessionScreen {
                     }
                     return ScreenAction::None;
                 }
-                KeyCode::Char(c) if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                    // Vim/Emacs-style nav while filter input has focus.
+                KeyCode::Char(c @ ('j' | 'n' | 'k' | 'p')) if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                    // Vim/Emacs-style nav while filter input has focus. Other Ctrl
+                    // chords (Ctrl+U, Ctrl+W) fall through to the input handler.
                     if !self.awaiting_repo_path {
                         match c {
                             'j' | 'n' => self.move_selection(1),
