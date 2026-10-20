@@ -94,7 +94,8 @@ fn read_claude_status(key: &str, dir: &Path) -> Option<PaneStatus> {
             continue;
         }
         let state = match session.status.as_deref() {
-            Some("busy") => "working",
+            // "shell": turn ended but a background task is still running
+            Some("busy" | "shell") => "working",
             Some("waiting") => "prompting",
             Some("idle") => "idle",
             _ => continue,
@@ -207,7 +208,7 @@ mod tests {
     fn claude_status_maps_session_file_states_by_pane() {
         let dir = tempfile::tempdir().unwrap();
         let me = std::process::id();
-        for (status, expected) in [("busy", "working"), ("waiting", "prompting"), ("idle", "idle")] {
+        for (status, expected) in [("busy", "working"), ("shell", "working"), ("waiting", "prompting"), ("idle", "idle")] {
             write_claude_session(dir.path(), "s", me, "proj/feat:@3.%41", status);
             let got = read_claude_status("41", dir.path()).unwrap();
             assert_eq!(got.state, expected);
@@ -228,7 +229,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let me = std::process::id();
         write_claude_session(dir.path(), "dead", 4194303, "p:@1.%7", "busy");
-        write_claude_session(dir.path(), "shell", me, "p:@1.%8", "shell");
+        write_claude_session(dir.path(), "unknown", me, "p:@1.%8", "not-a-status");
         fs::write(dir.path().join("none.json"), format!(r#"{{"pid":{me},"tmux":null,"status":"busy"}}"#)).unwrap();
         fs::write(dir.path().join("junk.json"), "not json").unwrap();
         fs::write(dir.path().join("x.key"), "ignored").unwrap();
