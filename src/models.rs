@@ -16,6 +16,8 @@ pub struct Session {
     pub base_branch: String,
     pub created_at: String,
     pub last_selected_at: Option<String>,
+    /// Agent command chosen at creation; `None` falls back to the `agent_cmd` setting.
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
