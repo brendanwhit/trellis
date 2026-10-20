@@ -126,6 +126,23 @@ The conversation-index parse in `HistoryScreen::new`, `git::list_branches` in bo
 and the edit-branch modal, and the repos-directory walk in `NewSessionScreen::new`. None
 touches the database, so each is a drop-in worker plus a `loading…` state.
 
+## Status
+
+Landed: Phase 1, Phase 2, the conversation-index parse from Phase 4, and the PR
+review fetch from Phase 3.
+
+Not landed, still blocking on the event loop:
+
+- **Phase 3 remainder.** `create_session` still calls `git::fetch_and_pull`
+  (`manager.rs`) inline — the same network cost as the review path and the same
+  clean seam, since the fetch precedes all db work. `resurrect_session` and
+  `add_tab` are dominated by `git worktree add` and roughly eight tmux spawns;
+  both are local, so they are less severe but still visible on a large repo.
+- **Phase 4 remainder.** `wizard_load_branches` (`tui/mod.rs`, used by
+  `new_session`, `adopt_session` and `edit_branch`) and the repos-directory walk
+  in `NewSessionScreen::new`. Both are one-shots in the millisecond range on a
+  normal repo, which is why they were left for last.
+
 ## Testing
 
 `Job` is tested without threads by constructing it around a channel and pushing `JobMsg`
