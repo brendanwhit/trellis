@@ -88,6 +88,60 @@ pub fn apply_layout(session_name: &str, working_dir: &str) -> Result<(), tmux::T
     Ok(())
 }
 
+/// Find or create the on-disk worktree for (repo, branch).
+///
+/// Git's `worktree list` is the source of truth. If a worktree for `branch`
+/// already exists, returns its recorded path (even if outside `worktrees_dir`).
+/// If git considers a worktree prunable (dir gone), prunes and reattaches the
+/// worktree to the still-existing branch. Otherwise creates fresh at the
+/// trellis-convention path, branching from `start_point`.
+///
+/// `start_point` is only consulted when creating a NEW local branch. Callers
+/// pass what they want the branch rooted at (e.g. `repo.default_branch`,
+/// `session.base_branch`, or `format!("origin/{}", branch)` for PR review).
+pub fn resolve_or_create_worktree(
+    repo_path: &str,
+    repo_name: &str,
+    branch: &str,
+    worktrees_dir: &str,
+    start_point: &str,
+) -> Result<String, String> {
+    let mut needs_prune = false;
+    let existing = git::list_worktrees(repo_path).map_err(|e| e.to_string())?;
+    for wt in &existing {
+        if wt.branch.as_deref() == Some(branch) {
+            if !Path::new(&wt.path).exists() {
+                needs_prune = true;
+                break;
+            }
+            return Ok(wt.path.clone());
+        }
+    }
+
+    if needs_prune {
+        let _ = git::prune_worktrees(repo_path);
+    }
+
+    let wt_path = Path::new(worktrees_dir)
+        .join(repo_name)
+        .join(branch.replace('/', "-"))
+        .to_string_lossy()
+        .to_string();
+
+    // Pick between `git worktree add -b <branch> <path> <start>` (new branch)
+    // and `git worktree add <path> <branch>` (existing branch). After a prune,
+    // the local branch ref still exists, so the existing-branch path is taken.
+    let branches = git::list_branches(repo_path).map_err(|e| e.to_string())?;
+    if branches.iter().any(|b| b == branch) {
+        git::add_worktree_existing_branch(repo_path, &wt_path, branch)
+            .map_err(|e| format!("Failed to attach worktree: {}", e))?;
+    } else {
+        git::create_worktree(repo_path, &wt_path, branch, start_point)
+            .map_err(|e| format!("Failed to create worktree: {}", e))?;
+    }
+    Ok(wt_path)
+}
+
 /// Detect subsystem directories in a monorepo (e.g. workers/model_train, src/sojourner).
 pub fn detect_subsystems(repo_path: &str) -> Vec<String> {
     let root = Path::new(repo_path);
@@ -140,12 +194,67 @@ impl Manager {
             .unwrap_or_else(|| dirs::home_dir().unwrap().join("dev").join("worktrees"))
     }
 
-    pub fn worktree_path(&self, repo_name: &str, branch: &str) -> String {
-        self.worktrees_dir()
-            .join(repo_name)
-            .join(branch.replace("/", "-"))
-            .to_string_lossy()
-            .to_string()
+    fn find_or_create_worktree(
+        &self,
+        repo: &Repo,
+        branch: &str,
+        start_point: &str,
+    ) -> Result<String, String> {
+        resolve_or_create_worktree(
+            &repo.path,
+            &repo.name,
+            branch,
+            &self.worktrees_dir().to_string_lossy(),
+            start_point,
+        )
+    }
+
+    fn find_or_create_session(&self, repo: &Repo, branch: &str, wt_path: &str) -> Result<Session, String> {
+        let session_name = tmux::sanitize_session_name(branch);
+
+        // Existing DB row?
+        if let Some(existing) = self.get_session_by_name(&session_name) {
+            if existing.repo_id == repo.id.unwrap() && tmux::session_exists(&session_name) {
+                return Ok(existing);
+            }
+            // Stale row — drop it.
+            if let Some(id) = existing.id {
+                self.delete_session(id, false)?;
+            }
+        }
+
+        // tmux first — fail loudly before touching the DB.
+        apply_layout(&session_name, wt_path)
+            .map_err(|e| format!("Failed to create tmux session: {}", e))?;
+
+        let session = db::add_session(
+            &self.conn,
+            &Session {
+                id: None,
+                name: session_name.clone(),
+                repo_id: repo.id.unwrap(),
+                base_branch: branch.to_string(),
+                created_at: utc_now(),
+                last_selected_at: None,
+            },
+        );
+
+        if wt_path != repo.path && db::get_worktree_by_path(&self.conn, wt_path).is_none() {
+            db::add_worktree(
+                &self.conn,
+                &Worktree {
+                    id: None,
+                    repo_id: repo.id.unwrap(),
+                    path: wt_path.to_string(),
+                    branch: branch.to_string(),
+                    session_id: session.id,
+                    tmux_window: None,
+                    created_at: utc_now(),
+                },
+            );
+        }
+
+        Ok(session)
     }
 
     // ------------------------------------------------------------------
@@ -201,7 +310,9 @@ impl Manager {
     // Public API
     // ------------------------------------------------------------------
 
-    /// Register repo if needed, create worktree, create DB session, create tmux session.
+    /// Register repo if needed, create or reuse worktree, create or reuse DB
+    /// session, create tmux session. If a live session for (repo, base_branch)
+    /// already exists, routes to it (user-typed `session_name` ignored).
     pub fn create_session(
         &self,
         repo_path: &str,
@@ -211,41 +322,55 @@ impl Manager {
     ) -> Result<Session, String> {
         let repo = self.get_or_create_repo(repo_path);
 
-        let default = &repo.default_branch;
-        let start_dir = if base_branch == default {
-            repo_path.to_string()
-        } else {
-            // Fetch latest before creating worktree (non-fatal — stale state is acceptable)
-            let _ = git::fetch_and_pull(repo_path, default);
-
-            let wt_path = self.worktree_path(&repo.name, base_branch);
-            match git::create_worktree(repo_path, &wt_path, base_branch, default) {
-                Ok(()) => {}
-                Err(e) => {
-                    // Branch/worktree may already exist - use it if the dir is there
-                    if !Path::new(&wt_path).exists() {
-                        return Err(format!("Worktree creation failed: {}", e));
-                    }
-                }
+        // Spec: "n on branch X when X already has a session — route to the
+        // existing session." Consult by branch BEFORE honoring the user-typed
+        // name. The wizard's auto_session_name disambiguates to "feat-x-2",
+        // "feat-x-3", etc. when a session for the branch exists; bypass that.
+        let by_branch: Vec<Session> = db::get_sessions(&self.conn)
+            .into_iter()
+            .filter(|s| s.repo_id == repo.id.unwrap() && s.base_branch == base_branch)
+            .collect();
+        for s in by_branch {
+            if tmux::session_exists(&s.name) {
+                return Ok(s);
             }
-            wt_path
+            // Dead tmux session — drop stale row and continue.
+            if let Some(id) = s.id {
+                self.delete_session(id, false)?;
+            }
+        }
+
+        // No live session for this branch. Resolve the worktree.
+        let wt_path = if base_branch == repo.default_branch {
+            repo.path.clone()
+        } else {
+            // Fetch latest before resolving worktree (non-fatal — stale is acceptable).
+            let _ = git::fetch_and_pull(repo_path, &repo.default_branch);
+            // New branches root at the repo's default branch.
+            self.find_or_create_worktree(&repo, base_branch, &repo.default_branch)?
         };
 
-        let effective_dir = if let Some(sub) = subdirectory {
-            Path::new(&start_dir).join(sub).to_string_lossy().to_string()
+        // Honor the user-typed session name (or fall back to sanitized branch).
+        let chosen_name = if session_name.is_empty() {
+            tmux::sanitize_session_name(base_branch)
         } else {
-            start_dir.clone()
+            tmux::sanitize_session_name(session_name)
+        };
+
+        let effective_dir = match subdirectory {
+            Some(sub) => Path::new(&wt_path).join(sub).to_string_lossy().to_string(),
+            None => wt_path.clone(),
         };
 
         // tmux first — fail loudly before touching the DB.
-        apply_layout(session_name, &effective_dir)
+        apply_layout(&chosen_name, &effective_dir)
             .map_err(|e| format!("Failed to create tmux session: {}", e))?;
 
         let session = db::add_session(
             &self.conn,
             &Session {
                 id: None,
-                name: session_name.to_string(),
+                name: chosen_name.clone(),
                 repo_id: repo.id.unwrap(),
                 base_branch: base_branch.to_string(),
                 created_at: utc_now(),
@@ -253,14 +378,13 @@ impl Manager {
             },
         );
 
-        // Record worktree if we created one
-        if start_dir != repo_path {
+        if wt_path != repo.path && db::get_worktree_by_path(&self.conn, &wt_path).is_none() {
             db::add_worktree(
                 &self.conn,
                 &Worktree {
                     id: None,
                     repo_id: repo.id.unwrap(),
-                    path: start_dir,
+                    path: wt_path.clone(),
                     branch: base_branch.to_string(),
                     session_id: session.id,
                     tmux_window: None,
@@ -336,8 +460,8 @@ impl Manager {
         })
     }
 
-    /// Create a worktree + session for a PR number or branch, ready for review.
-    /// Returns (session, worktree_path). Reuses existing if found.
+    /// Create or reuse worktree + session for a PR number or branch, ready
+    /// for review. Returns (session, worktree_path).
     pub fn checkout_and_review(
         &self,
         repo_path: &str,
@@ -345,71 +469,20 @@ impl Manager {
     ) -> Result<(Session, String), String> {
         let repo = self.get_or_create_repo(repo_path);
 
-        // Resolve PR number to branch name
-        let branch = if pr_or_branch.chars().all(|c| c.is_ascii_digit()) && !pr_or_branch.is_empty()
-        {
+        let branch = if pr_or_branch.chars().all(|c| c.is_ascii_digit()) && !pr_or_branch.is_empty() {
             let pr_num: i64 = pr_or_branch.parse().unwrap();
-            git::get_pr_branch(repo_path, pr_num)
-                .map_err(|e| format!("Failed to get PR branch: {}", e))?
+            git::get_pr_branch(repo_path, pr_num).map_err(|e| format!("Failed to get PR branch: {}", e))?
         } else {
             pr_or_branch.to_string()
         };
 
-        // Fetch the branch so it's available locally
         git::fetch_branch(repo_path, &branch);
 
-        // Check if we already have a session for this branch
-        let session_name = tmux::sanitize_session_name(&branch);
-        let wt_path = self.worktree_path(&repo.name, &branch);
-        let existing_session = self.get_session_by_name(&session_name);
-
-        if let Some(ref s) = existing_session {
-            if Path::new(&wt_path).exists() {
-                return Ok((s.clone(), wt_path));
-            }
-        }
-
-        // Create worktree if it doesn't already exist on disk
-        if !Path::new(&wt_path).exists() {
-            let base = format!("origin/{}", branch);
-            git::create_worktree(repo_path, &wt_path, &branch, &base)
-                .map_err(|e| format!("Failed to create worktree: {}", e))?;
-        }
-
-        if let Some(s) = existing_session {
-            return Ok((s, wt_path));
-        }
-
-        // tmux first — fail loudly before touching the DB.
-        apply_layout(&session_name, &wt_path)
-            .map_err(|e| format!("Failed to create tmux session: {}", e))?;
-
-        let session = db::add_session(
-            &self.conn,
-            &Session {
-                id: None,
-                name: session_name.clone(),
-                repo_id: repo.id.unwrap(),
-                base_branch: branch.clone(),
-                created_at: utc_now(),
-                last_selected_at: None,
-            },
-        );
-
-        // Record worktree
-        db::add_worktree(
-            &self.conn,
-            &Worktree {
-                id: None,
-                repo_id: repo.id.unwrap(),
-                path: wt_path.clone(),
-                branch: branch.clone(),
-                session_id: session.id,
-                tmux_window: None,
-                created_at: utc_now(),
-            },
-        );
-
+        // PR review roots the new local branch at the PR's HEAD on the remote,
+        // not main — preserves the original `checkout_and_review` semantic.
+        let start_point = format!("origin/{}", branch);
+        let wt_path = self.find_or_create_worktree(&repo, &branch, &start_point)?;
+        let session = self.find_or_create_session(&repo, &branch, &wt_path)?;
         Ok((session, wt_path))
     }
 
@@ -463,7 +536,9 @@ impl Manager {
         Ok(self.persist_adopted_worktree(repo_id, path, branch, session_name))
     }
 
-    /// Create a worktree + tmux window for the given session.
+    /// Create or reuse a worktree + tmux window for the given session.
+    /// If a worktree for `branch_name` already exists, attaches a new tmux
+    /// window to it instead of erroring.
     pub fn add_tab(&self, session_id: i64, branch_name: &str) -> Result<Worktree, String> {
         let session = self
             .get_session_by_id(session_id)
@@ -473,23 +548,26 @@ impl Manager {
             .get_repo_by_id(session.repo_id)
             .ok_or_else(|| format!("Repo {} not found", session.repo_id))?;
 
-        let wt_path = self.worktree_path(&repo.name, branch_name);
-        git::create_worktree(&repo.path, &wt_path, branch_name, &session.base_branch)
-            .map_err(|e| format!("Failed to create worktree: {}", e))?;
+        // New branches in a tab root at the session's base branch (preserves existing behavior).
+        let wt_path = self.find_or_create_worktree(&repo, branch_name, &session.base_branch)?;
         let _ = tmux::new_window(&session.name, branch_name, Some(&wt_path));
 
-        let worktree = db::add_worktree(
-            &self.conn,
-            &Worktree {
-                id: None,
-                repo_id: repo.id.unwrap(),
-                path: wt_path,
-                branch: branch_name.to_string(),
-                session_id: Some(session_id),
-                tmux_window: None,
-                created_at: utc_now(),
-            },
-        );
+        let worktree = if let Some(existing) = db::get_worktree_by_path(&self.conn, &wt_path) {
+            existing
+        } else {
+            db::add_worktree(
+                &self.conn,
+                &Worktree {
+                    id: None,
+                    repo_id: repo.id.unwrap(),
+                    path: wt_path,
+                    branch: branch_name.to_string(),
+                    session_id: Some(session_id),
+                    tmux_window: None,
+                    created_at: utc_now(),
+                },
+            )
+        };
 
         Ok(worktree)
     }
@@ -1078,5 +1156,150 @@ mod tests {
         assert_eq!(worktrees[0].branch, "feat-a");
         assert_eq!(worktrees[0].repo_id, repo.id.unwrap());
         assert_eq!(worktrees[0].session_id, session.id);
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn init_repo(dir: &Path) {
+        Command::new("git").args(["init", "-q"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["config", "user.name", "t"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["commit", "--allow-empty", "-qm", "init"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["branch", "-M", "main"]).current_dir(dir).output().unwrap();
+    }
+
+    fn make_repo(tmp: &Path) -> (String, String) {
+        let canonical = tmp.canonicalize().unwrap();
+        let repo = canonical.join("repo");
+        let worktrees = canonical.join("worktrees");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&worktrees).unwrap();
+        init_repo(&repo);
+        (repo.to_string_lossy().to_string(), worktrees.to_string_lossy().to_string())
+    }
+
+    #[test]
+    fn resolve_creates_when_no_existing_worktree() {
+        let tmp = tempdir().unwrap();
+        let (repo, wts) = make_repo(tmp.path());
+        let path = resolve_or_create_worktree(&repo, "myrepo", "feat/x", &wts, "main").unwrap();
+        assert!(Path::new(&path).exists());
+        assert!(path.ends_with("feat-x"));
+    }
+
+    #[test]
+    fn resolve_reuses_existing_worktree() {
+        let tmp = tempdir().unwrap();
+        let (repo, wts) = make_repo(tmp.path());
+        let first = resolve_or_create_worktree(&repo, "myrepo", "feat/x", &wts, "main").unwrap();
+        let second = resolve_or_create_worktree(&repo, "myrepo", "feat/x", &wts, "main").unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn resolve_recovers_from_prunable_worktree() {
+        let tmp = tempdir().unwrap();
+        let (repo, wts) = make_repo(tmp.path());
+        let first = resolve_or_create_worktree(&repo, "myrepo", "feat/x", &wts, "main").unwrap();
+        // Nuke the dir behind git's back to make it prunable.
+        fs::remove_dir_all(&first).unwrap();
+        let second = resolve_or_create_worktree(&repo, "myrepo", "feat/x", &wts, "main").unwrap();
+        assert!(Path::new(&second).exists());
+    }
+
+    #[test]
+    fn resolve_finds_worktree_at_nonconventional_path() {
+        let tmp = tempdir().unwrap();
+        let (repo, wts) = make_repo(tmp.path());
+        // User created a worktree at an unusual path outside our convention.
+        let unusual = tmp.path().canonicalize().unwrap().join("unusual-spot");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "feat-y", unusual.to_str().unwrap(), "main"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        // Now ask trellis to find/create for feat-y — should return the unusual path.
+        let found = resolve_or_create_worktree(&repo, "myrepo", "feat-y", &wts, "main").unwrap();
+        assert_eq!(found, unusual.to_string_lossy().to_string());
+    }
+
+    // ------------------------------------------------------------------
+    // find_or_create_session tests
+    // ------------------------------------------------------------------
+
+    fn make_manager() -> Manager {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_schema(&conn);
+        Manager::new(conn)
+    }
+
+    /// Cleans up a tmux session at end of test (even on panic).
+    struct SessionGuard(String);
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            let _ = crate::tmux::kill_session(&self.0);
+        }
+    }
+
+    /// Process-unique branch name. tmux::sanitize_session_name leaves `-` and
+    /// alphanumerics alone, so the sanitized version is identical.
+    fn unique_branch(suffix: &str) -> String {
+        format!("trellistest-{}-{}", std::process::id(), suffix)
+    }
+
+    #[test]
+    fn find_or_create_session_inserts_when_missing() {
+        let tmp = tempdir().unwrap();
+        let (repo_path, _) = make_repo(tmp.path());
+        let mgr = make_manager();
+
+        let repo = mgr.get_or_create_repo(&repo_path);
+        let branch = unique_branch("fresh");
+        let _guard = SessionGuard(crate::tmux::sanitize_session_name(&branch));
+        let wt_path = tmp.path().join("wt").to_string_lossy().to_string();
+
+        let session = mgr.find_or_create_session(&repo, &branch, &wt_path).unwrap();
+        assert_eq!(session.base_branch, branch);
+        assert!(crate::db::get_session_by_name(&mgr.conn, &session.name).is_some());
+    }
+
+    #[test]
+    fn find_or_create_session_drops_stale_db_row_then_inserts() {
+        let tmp = tempdir().unwrap();
+        let (repo_path, _) = make_repo(tmp.path());
+        let mgr = make_manager();
+
+        let repo = mgr.get_or_create_repo(&repo_path);
+        let branch = unique_branch("stale");
+        let session_name = crate::tmux::sanitize_session_name(&branch);
+        let _guard = SessionGuard(session_name.clone());
+
+        // Pre-insert a "stale" DB row. The corresponding tmux session does not
+        // exist yet (unique name + Drop cleanup guarantees this across runs).
+        crate::db::add_session(&mgr.conn, &crate::models::Session {
+            id: None,
+            name: session_name.clone(),
+            repo_id: repo.id.unwrap(),
+            base_branch: branch.clone(),
+            created_at: crate::utils::utc_now(),
+            last_selected_at: None,
+        });
+        assert!(crate::db::get_session_by_name(&mgr.conn, &session_name).is_some());
+        assert!(!crate::tmux::session_exists(&session_name));
+
+        let wt_path = tmp.path().join("wt").to_string_lossy().to_string();
+        let fresh = mgr.find_or_create_session(&repo, &branch, &wt_path).unwrap();
+        assert_eq!(fresh.name, session_name);
+        let rows: Vec<_> = crate::db::get_sessions(&mgr.conn)
+            .into_iter()
+            .filter(|s| s.name == session_name)
+            .collect();
+        assert_eq!(rows.len(), 1);
     }
 }
