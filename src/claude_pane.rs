@@ -144,7 +144,13 @@ pub fn find_latest_conversation(cwd: &Path) -> Option<String> {
 ///
 /// `projects_dir` is the `~/.claude/projects` location (parameterized for tests).
 fn find_latest_conversation_in(projects_dir: &Path, cwd: &Path) -> Option<String> {
-    let encoded = cwd.to_string_lossy().replace('/', "-");
+    // Claude Code names the dir by replacing every non-alphanumeric byte of the
+    // cwd with `-` (so `/a/.b_c` -> `-a--b-c`), not just the slashes.
+    let encoded: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
     let dir = projects_dir.join(&encoded);
     let entries = fs::read_dir(&dir).ok()?;
 
@@ -313,6 +319,21 @@ mod tests {
 
         let result = find_latest_conversation_in(projects.path(), cwd);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_latest_encodes_dots_and_underscores_as_dashes() {
+        use std::fs::File;
+        use tempfile::tempdir;
+
+        let projects = tempdir().unwrap();
+        let cwd = Path::new("/r/.claude/worktrees/my_branch");
+        let expected_dir = projects.path().join("-r--claude-worktrees-my-branch");
+        fs::create_dir_all(&expected_dir).unwrap();
+        File::create(expected_dir.join("only.jsonl")).unwrap();
+
+        let result = find_latest_conversation_in(projects.path(), cwd);
+        assert_eq!(result.as_deref(), Some("only"));
     }
 
     #[test]
