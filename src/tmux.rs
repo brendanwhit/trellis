@@ -160,20 +160,6 @@ pub fn new_window(session: &str, name: &str, start_dir: Option<&str>) -> Result<
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-pub fn select_window(session: &str, index: i64) -> Result<(), TmuxError> {
-    let target = format!("{}:{}", session, index);
-    let output = run(&["select-window", "-t", &target]);
-    if !output.status.success() {
-        return Err(TmuxError(format!(
-            "Failed to select window {} in '{}': {}",
-            index,
-            session,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(())
-}
-
 /// Select a window by its name rather than index — robust to tmux's
 /// configurable `base-index` (default 0, but commonly set to 1).
 pub fn select_window_by_name(session: &str, name: &str) -> Result<(), TmuxError> {

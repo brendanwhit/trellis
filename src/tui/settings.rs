@@ -281,7 +281,7 @@ fn line_offset(s: &str, cursor: usize) -> (usize, usize) {
 }
 
 #[cfg(test)]
-mod debug_tests {
+mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

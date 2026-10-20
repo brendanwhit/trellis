@@ -38,7 +38,7 @@ On first launch, trellis opens its settings screen so you can confirm where your
 
 **Actions menu** (`.`) opens a per-session menu — change branch, launch Claude, or adopt an unmanaged session.
 
-**Settings** (`S`) configures repos directory, worktrees directory, etc.
+**Settings** (`S`) configures the repos directories (one per line), the worktrees directory, etc.
 
 ## Keybinds
 
@@ -50,6 +50,7 @@ On first launch, trellis opens its settings screen so you can confirm where your
 | `/` | Filter sessions |
 | `n` | New session |
 | `t` | New worktree tab |
+| `T` | Plain tab (tmux window in the current directory, no worktree) |
 | `R` | PR review (PR number or branch) |
 | `r` | Rename session |
 | `d` | Delete session or kill tab |

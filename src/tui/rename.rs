@@ -173,7 +173,7 @@ pub fn render_input(f: &mut Frame, area: Rect, input: &str, cursor_pos: usize) {
 }
 
 #[cfg(test)]
-mod debug_tests {
+mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
