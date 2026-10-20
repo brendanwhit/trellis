@@ -14,11 +14,11 @@ use crate::tmux;
 
 use crate::utils::utc_now;
 
-/// Default tmux layout: (window_name, optional command to send).
-const DEFAULT_LAYOUT: &[(&str, Option<&str>)] = &[
-    ("claude", None),
-    ("shell", None),
-];
+/// Window the agent runs in; second window is a plain shell.
+pub const AGENT_WINDOW: &str = "agent";
+const SHELL_WINDOW: &str = "shell";
+/// Agent launched when `agent_cmd` is unset.
+pub const DEFAULT_AGENT_CMD: &str = "pi";
 
 /// A worktree git knows about that Trellis hasn't registered yet.
 #[derive(Debug, Clone)]
@@ -68,27 +68,21 @@ fn filter_orphans(
     out
 }
 
-/// Create a tmux session and set up windows according to the default layout.
+/// Create a tmux session and set up the default layout: an agent window
+/// running `agent_cmd` and a shell window, both rooted at `working_dir`.
 ///
-/// The first layout entry becomes the session's initial window — named at
+/// The agent window becomes the session's initial window — named at
 /// `tmux new-session` time via `-n`, so we don't depend on tmux's
-/// configurable `base-index`. Subsequent entries become additional windows.
-pub fn apply_layout(session_name: &str, working_dir: &str, claude_cmd: &str) -> Result<(), tmux::TmuxError> {
-    let (first_name, _) = DEFAULT_LAYOUT[0];
-    tmux::new_session(session_name, working_dir, Some(first_name))?;
-    let target = format!("{}:{}", session_name, first_name);
-    tmux::send_keys(&target, &[claude_cmd, "Enter"]);
+/// configurable `base-index`.
+pub fn apply_layout(session_name: &str, working_dir: &str, agent_cmd: &str) -> Result<(), tmux::TmuxError> {
+    tmux::new_session(session_name, working_dir, Some(AGENT_WINDOW))?;
+    let target = format!("{}:{}", session_name, AGENT_WINDOW);
+    tmux::send_keys(&target, &[agent_cmd, "Enter"]);
 
-    for &(name, command) in &DEFAULT_LAYOUT[1..] {
-        let _ = tmux::new_window(session_name, name, Some(working_dir));
-        if let Some(cmd) = command {
-            let target = format!("{}:{}", session_name, name);
-            tmux::send_keys(&target, &[cmd, "Enter"]);
-        }
-    }
+    let _ = tmux::new_window(session_name, SHELL_WINDOW, Some(working_dir));
 
-    // Focus the first window by name (base-index agnostic).
-    let _ = tmux::select_window_by_name(session_name, first_name);
+    // Focus the agent window by name (base-index agnostic).
+    let _ = tmux::select_window_by_name(session_name, AGENT_WINDOW);
     Ok(())
 }
 
@@ -213,6 +207,16 @@ impl Manager {
             .unwrap_or_else(|| dirs::home_dir().unwrap().join("dev").join("worktrees"))
     }
 
+    /// Command that launches the coding agent in a session's agent window.
+    /// Must accept `-c` to continue the most recent conversation for its cwd
+    /// (`pi`, `omp`, and `claude` all do).
+    pub fn agent_cmd(&self) -> String {
+        db::get_config(&self.conn, "agent_cmd")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_AGENT_CMD.to_string())
+    }
+
     fn find_or_create_worktree(
         &self,
         repo: &Repo,
@@ -277,10 +281,10 @@ impl Manager {
             return Err(format!("path '{}' no longer exists", wt_path));
         }
 
-        let claude_cmd = crate::claude_pane::find_latest_conversation(Path::new(&wt_path))
-            .map(|id| format!("claude --resume {}", id))
-            .unwrap_or_else(|| "claude".to_string());
-        apply_layout(&session.name, &wt_path, &claude_cmd)
+        // Pick the conversation back up: every supported agent continues its
+        // most recent session for the cwd with `-c`, and starts fresh if none.
+        let revive_cmd = format!("{} -c", self.agent_cmd());
+        apply_layout(&session.name, &wt_path, &revive_cmd)
             .map_err(|e| format!("Failed to create tmux session: {}", e))?;
         Ok(())
     }
@@ -303,7 +307,7 @@ impl Manager {
         }
 
         // tmux first — fail loudly before touching the DB.
-        apply_layout(&session_name, wt_path, "claude")
+        apply_layout(&session_name, wt_path, &self.agent_cmd())
             .map_err(|e| format!("Failed to create tmux session: {}", e))?;
 
         let session = db::add_session(
@@ -442,7 +446,7 @@ impl Manager {
         };
 
         // tmux first — fail loudly before touching the DB.
-        apply_layout(&chosen_name, &effective_dir, "claude")
+        apply_layout(&chosen_name, &effective_dir, &self.agent_cmd())
             .map_err(|e| format!("Failed to create tmux session: {}", e))?;
 
         let session = db::add_session(
@@ -621,7 +625,7 @@ impl Manager {
         branch: &str,
         session_name: &str,
     ) -> Result<Session, String> {
-        apply_layout(session_name, path, "claude")
+        apply_layout(session_name, path, &self.agent_cmd())
             .map_err(|e| format!("Failed to create tmux session: {}", e))?;
         Ok(self.persist_adopted_worktree(repo_id, path, branch, session_name))
     }
@@ -1456,19 +1460,19 @@ mod reuse_tests {
     fn apply_layout_creates_named_windows_independent_of_base_index() {
         // The bug we're fixing: hardcoded window index 1 in rename_window
         // silently failed on default tmux (base-index 0), leaving the first
-        // window with tmux's default name ("zsh") instead of "claude".
-        // The fix passes -n claude at new-session time, so the first window
-        // is correctly named regardless of base-index.
+        // window with tmux's default name ("zsh") instead of the agent window.
+        // The fix passes -n at new-session time, so the first window is
+        // correctly named regardless of base-index.
         let tmp = tempdir().unwrap();
         let session_name = format!("trellistest-layout-{}", std::process::id());
         let _guard = SessionGuard(session_name.clone());
 
-        apply_layout(&session_name, &tmp.path().to_string_lossy(), "claude").unwrap();
+        apply_layout(&session_name, &tmp.path().to_string_lossy(), "true").unwrap();
         assert!(crate::tmux::session_exists(&session_name));
 
         let windows = crate::tmux::list_windows(&session_name);
         let names: Vec<String> = windows.iter().map(|w| w.name.clone()).collect();
-        assert_eq!(names, vec!["claude".to_string(), "shell".to_string()]);
+        assert_eq!(names, vec![AGENT_WINDOW.to_string(), "shell".to_string()]);
     }
 
     #[test]
