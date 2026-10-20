@@ -140,6 +140,17 @@ pub fn session_active_pane_path(session: &str) -> Option<String> {
     if path.is_empty() { None } else { Some(path) }
 }
 
+/// Session a pane belongs to, and whether a client is attached to it.
+pub fn pane_session(pane_id: &str) -> Option<(String, bool)> {
+    let output = run(&["display-message", "-p", "-t", pane_id, "#{session_name}\t#{session_attached}"]);
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (name, attached) = text.trim_end().split_once('\t')?;
+    Some((name.to_string(), attached != "0"))
+}
+
 /// Return the name of the session the calling client is currently attached
 /// to (i.e. the parent session when running inside `display-popup`).
 pub fn attached_session() -> Option<String> {
