@@ -8,9 +8,10 @@ use crate::manager::Manager;
 use super::{ScreenAction, ScreenBehavior};
 use super::theme;
 
-const CONFIG_KEYS: &[(&str, &str)] = &[
-    ("repos_dir", "Repos directory"),
-    ("worktrees_dir", "Worktrees directory"),
+const CONFIG_KEYS: &[(&str, &str, bool)] = &[
+    // (key, label, multiline)
+    ("repos_dir", "Repos directories (one path per line)", true),
+    ("worktrees_dir", "Worktrees directory", false),
 ];
 
 struct Field {
@@ -18,16 +19,26 @@ struct Field {
     label: String,
     value: String,
     cursor: usize,
+    multiline: bool,
 }
 
 impl Field {
-    fn new(key: &str, label: &str, value: &str) -> Self {
+    fn new(key: &str, label: &str, value: &str, multiline: bool) -> Self {
         let cursor = value.len();
         Self {
             key: key.to_string(),
             label: label.to_string(),
             value: value.to_string(),
             cursor,
+            multiline,
+        }
+    }
+
+    fn line_count(&self) -> usize {
+        if self.multiline {
+            self.value.lines().count().max(1)
+        } else {
+            1
         }
     }
 }
@@ -46,9 +57,9 @@ impl SettingsScreen {
 
         let fields = CONFIG_KEYS
             .iter()
-            .map(|(key, label)| {
+            .map(|(key, label, multiline)| {
                 let value = config.get(*key).cloned().unwrap_or_default();
-                Field::new(key, label, &value)
+                Field::new(key, label, &value, *multiline)
             })
             .collect();
 
@@ -62,12 +73,34 @@ impl SettingsScreen {
 
     fn handle_field_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         let field = &mut self.fields[self.focused];
-        super::rename::input_handle_key(&mut field.value, &mut field.cursor, code, modifiers);
+        super::rename::input_handle_key_ex(
+            &mut field.value,
+            &mut field.cursor,
+            code,
+            modifiers,
+            field.multiline,
+        );
+    }
+
+    /// Clean a field's value before saving: trim each line, drop blank lines.
+    /// For single-line fields this collapses to the existing trim.
+    fn cleaned(field: &Field) -> String {
+        if field.multiline {
+            field
+                .value
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            field.value.trim().to_string()
+        }
     }
 
     fn save(&mut self, manager: &mut Manager) {
         for field in &self.fields {
-            let value = field.value.trim();
+            let value = Self::cleaned(field);
             if value.is_empty() {
                 self.status = format!("{} cannot be empty.", field.label);
                 self.status_is_error = true;
@@ -76,7 +109,7 @@ impl SettingsScreen {
             }
         }
         for field in &self.fields {
-            manager.set_config(&field.key, field.value.trim());
+            manager.set_config(&field.key, &Self::cleaned(field));
         }
         self.status = "Saved.".to_string();
         self.status_is_error = false;
@@ -86,18 +119,24 @@ impl SettingsScreen {
 impl ScreenBehavior for SettingsScreen {
     fn render(&self, f: &mut Frame, area: Rect, _manager: &Manager) {
         let width = 82u16;
-        let field_rows = self.fields.len() as u16 * 2;
-        let height = (field_rows + 8).min(area.height.saturating_sub(4));
+        // Each field: 1 label + N input lines + 1 gap. Plus 4 lines of chrome
+        // (hint + gap + status + footer).
+        let field_rows: u16 = self
+            .fields
+            .iter()
+            .map(|f| 1 + f.line_count() as u16 + 1)
+            .sum();
+        let height = (field_rows + 4).min(area.height.saturating_sub(4));
         let inner = super::rename::render_modal_box(f, area, "Settings", width, height);
 
-        // Build constraints: hint, gap, then per-field: label + input, status, footer hint
+        // Build constraints: hint, gap, then per-field: label + input(s) + gap, status, footer hint
         let mut constraints = vec![
             Constraint::Length(1), // hint
             Constraint::Length(1), // gap
         ];
-        for _ in &self.fields {
+        for field in &self.fields {
             constraints.push(Constraint::Length(1)); // label
-            constraints.push(Constraint::Length(1)); // input
+            constraints.push(Constraint::Length(field.line_count() as u16)); // input(s)
             constraints.push(Constraint::Length(1)); // gap between fields
         }
         constraints.push(Constraint::Length(1)); // status
@@ -128,12 +167,37 @@ impl ScreenBehavior for SettingsScreen {
             f.render_widget(label, chunks[chunk_idx]);
             chunk_idx += 1;
 
-            // Input with cursor (only show cursor for focused field)
-            if is_focused {
-                super::rename::render_input(f, chunks[chunk_idx], &field.value, field.cursor);
+            // Input with cursor (only show cursor for focused field).
+            // Multi-line fields split the chunk into one row per line and
+            // route the cursor render to the line that contains it.
+            let input_area = chunks[chunk_idx];
+            if field.multiline {
+                let line_count = field.line_count();
+                let input_constraints: Vec<_> = (0..line_count).map(|_| Constraint::Length(1)).collect();
+                let line_chunks = Layout::vertical(input_constraints).split(input_area);
+                // Identify cursor line + column.
+                let (cur_line_idx, cur_col) = line_offset(&field.value, field.cursor);
+                for (i, line) in field.value.split('\n').enumerate() {
+                    if i >= line_chunks.len() {
+                        break;
+                    }
+                    if is_focused && i == cur_line_idx {
+                        super::rename::render_input(f, line_chunks[i], line, cur_col);
+                    } else {
+                        let style = if is_focused {
+                            Style::default()
+                        } else {
+                            Style::default().fg(theme::TEXT_DIM)
+                        };
+                        let p = Paragraph::new(Line::from(Span::styled(line.to_string(), style)));
+                        f.render_widget(p, line_chunks[i]);
+                    }
+                }
+            } else if is_focused {
+                super::rename::render_input(f, input_area, &field.value, field.cursor);
             } else {
                 let line = Line::from(Span::styled(field.value.clone(), Style::default().fg(theme::TEXT_DIM)));
-                f.render_widget(Paragraph::new(line), chunks[chunk_idx]);
+                f.render_widget(Paragraph::new(line), input_area);
             }
             chunk_idx += 1;
             chunk_idx += 1; // gap
@@ -155,11 +219,13 @@ impl ScreenBehavior for SettingsScreen {
         // Footer hint
         let footer = Line::from(vec![
             Span::styled("Enter", Style::default().fg(theme::ACCENT)),
-            Span::styled(" to save  ", Style::default().fg(theme::TEXT_DIM)),
+            Span::styled(" save  ", Style::default().fg(theme::TEXT_DIM)),
+            Span::styled("Alt+Enter", Style::default().fg(theme::ACCENT)),
+            Span::styled(" new line  ", Style::default().fg(theme::TEXT_DIM)),
             Span::styled("Tab", Style::default().fg(theme::ACCENT)),
-            Span::styled(" to switch field  ", Style::default().fg(theme::TEXT_DIM)),
+            Span::styled(" next field  ", Style::default().fg(theme::TEXT_DIM)),
             Span::styled("Escape", Style::default().fg(theme::ACCENT)),
-            Span::styled(" to cancel", Style::default().fg(theme::TEXT_DIM)),
+            Span::styled(" cancel", Style::default().fg(theme::TEXT_DIM)),
         ]);
         let footer_para = Paragraph::new(footer).alignment(Alignment::Center);
         f.render_widget(footer_para, chunks[chunk_idx]);
@@ -203,4 +269,13 @@ impl ScreenBehavior for SettingsScreen {
     fn is_modal(&self) -> bool {
         true
     }
+}
+
+/// Given a string with `\n` separators and a byte cursor offset, return
+/// (line_index, byte_offset_within_line).
+fn line_offset(s: &str, cursor: usize) -> (usize, usize) {
+    let cursor = cursor.min(s.len());
+    let line_start = s[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_idx = s[..cursor].matches('\n').count();
+    (line_idx, cursor - line_start)
 }

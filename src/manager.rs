@@ -186,10 +186,25 @@ impl Manager {
     // Properties
     // ------------------------------------------------------------------
 
-    pub fn repos_dir(&self) -> PathBuf {
-        db::get_config(&self.conn, "repos_dir")
+    /// Returns the list of directories under which trellis looks for repos.
+    /// Stored as a single config string with newline-separated paths so the
+    /// value migrates seamlessly from the original single-dir setup. Defaults
+    /// to `[~/dev]` if nothing is configured.
+    pub fn repos_dirs(&self) -> Vec<PathBuf> {
+        let raw = db::get_config(&self.conn, "repos_dir");
+        let parsed: Vec<PathBuf> = raw
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| dirs::home_dir().unwrap().join("dev"))
+            .collect();
+        if parsed.is_empty() {
+            vec![dirs::home_dir().unwrap().join("dev")]
+        } else {
+            parsed
+        }
     }
 
     pub fn worktrees_dir(&self) -> PathBuf {
@@ -817,9 +832,14 @@ impl Manager {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
+                // Try this dir first, then fall back to looking up by name
+                // across known_repos (covers the case where the repo lives in
+                // a different configured repos_dir).
                 let repo_path_candidate = home_dev.join(&repo_dir_name).to_string_lossy().to_string();
+                let already_known = known_repos.contains_key(&repo_path_candidate)
+                    || known_repos.values().any(|r| r.name == repo_dir_name);
 
-                if !known_repos.contains_key(&repo_path_candidate) {
+                if !already_known {
                     let candidate_path = Path::new(&repo_path_candidate);
                     if candidate_path.is_dir() {
                         let default_branch = git::detect_default_branch(&repo_path_candidate)
@@ -839,7 +859,17 @@ impl Manager {
                     }
                 }
 
-                let repo = &known_repos[&repo_path_candidate];
+                // Look up the repo by exact path first, then by name. The
+                // path lookup covers freshly-adopted repos in this same
+                // scan_worktrees call; the name lookup covers repos found in
+                // a different configured repos_dir.
+                let repo = match known_repos.get(&repo_path_candidate) {
+                    Some(r) => r,
+                    None => match known_repos.values().find(|r| r.name == repo_dir_name) {
+                        Some(r) => r,
+                        None => continue,
+                    },
+                };
                 let branch_name = branch_dir
                     .file_name()
                     .unwrap_or_default()
@@ -915,11 +945,10 @@ impl Manager {
                         );
                     }
                 } else {
-                    // Find the repo for this worktree
-                    let repos_dir = self.repos_dir();
-                    let repo_path_candidate =
-                        repos_dir.join(&repo_name).to_string_lossy().to_string();
-                    let repo = match known_repos.get(&repo_path_candidate) {
+                    // Find the repo for this worktree — match by name across
+                    // all known repos rather than constructing a candidate
+                    // path under a single repos_dir.
+                    let repo = match known_repos.values().find(|r| r.name == repo_name) {
                         Some(r) => r,
                         None => continue,
                     };
@@ -977,7 +1006,7 @@ impl Manager {
     /// First-run adoption: scan repos and worktrees dirs, scan live tmux sessions,
     /// and populate the DB with discovered state.
     pub fn scan_existing(&self) {
-        let home_dev = self.repos_dir();
+        let repos_dirs = self.repos_dirs();
         let worktrees_root = self.worktrees_dir();
         let mut known_repos: HashMap<String, Repo> = db::get_repos(&self.conn)
             .into_iter()
@@ -988,8 +1017,12 @@ impl Manager {
             .map(|wt| wt.path)
             .collect();
 
-        self.scan_repos(&home_dev, &mut known_repos);
-        self.scan_worktrees(&home_dev, &worktrees_root, &mut known_repos, &mut known_worktree_paths);
+        for dir in &repos_dirs {
+            self.scan_repos(dir, &mut known_repos);
+        }
+        for dir in &repos_dirs {
+            self.scan_worktrees(dir, &worktrees_root, &mut known_repos, &mut known_worktree_paths);
+        }
         self.scan_tmux_sessions(&known_repos);
         self.adopt_session_worktrees(&worktrees_root, &known_repos);
     }
@@ -1328,6 +1361,37 @@ mod reuse_tests {
         let session = mgr.find_or_create_session(&repo, &branch, &wt_path).unwrap();
         assert_eq!(session.base_branch, branch);
         assert!(crate::db::get_session_by_name(&mgr.conn, &session.name).is_some());
+    }
+
+    #[test]
+    fn repos_dirs_parses_multiline_config() {
+        let mgr = make_manager();
+        crate::db::set_config(&mgr.conn, "repos_dir", "/Users/x/personal\n/Users/x/work");
+        let dirs = mgr.repos_dirs();
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/Users/x/personal"),
+                PathBuf::from("/Users/x/work"),
+            ]
+        );
+    }
+
+    #[test]
+    fn repos_dirs_ignores_blank_lines_and_trims() {
+        let mgr = make_manager();
+        crate::db::set_config(&mgr.conn, "repos_dir", "  /a  \n\n  /b  \n");
+        let dirs = mgr.repos_dirs();
+        assert_eq!(dirs, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn repos_dirs_falls_back_to_default_when_blank() {
+        let mgr = make_manager();
+        crate::db::set_config(&mgr.conn, "repos_dir", "");
+        let dirs = mgr.repos_dirs();
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs[0].ends_with("dev"));
     }
 
     #[test]

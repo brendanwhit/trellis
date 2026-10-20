@@ -63,12 +63,20 @@ pub struct NewSessionScreen {
 
 impl NewSessionScreen {
     pub fn new(manager: &Manager) -> Self {
-        let repos_dir = manager.repos_dir();
+        let repos_dirs = manager.repos_dirs();
         let worktrees_dir = manager.worktrees_dir();
 
-        let mut dev_dirs: Vec<(String, String)> = Vec::new();
-        if repos_dir.is_dir() {
-            let mut entries: Vec<_> = std::fs::read_dir(&repos_dir)
+        // Collect (name, abs_path, parent_dir_label) across every configured dir.
+        let mut raw: Vec<(String, String, String)> = Vec::new();
+        for repos_dir in &repos_dirs {
+            if !repos_dir.is_dir() {
+                continue;
+            }
+            let parent_label = repos_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let entries: Vec<_> = std::fs::read_dir(repos_dir)
                 .into_iter()
                 .flatten()
                 .filter_map(|e| e.ok())
@@ -78,13 +86,33 @@ impl NewSessionScreen {
                         && !e.file_name().to_string_lossy().starts_with('.')
                 })
                 .collect();
-            entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
             for entry in entries {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let path = entry.path().to_string_lossy().to_string();
-                dev_dirs.push((name, path));
+                raw.push((name, path, parent_label.clone()));
             }
         }
+
+        // Count name occurrences for collision detection.
+        let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (name, _, _) in &raw {
+            *name_counts.entry(name.clone()).or_insert(0) += 1;
+        }
+
+        // Build display labels: plain name unless that name collides, in
+        // which case annotate with the parent dir.
+        let mut dev_dirs: Vec<(String, String)> = raw
+            .into_iter()
+            .map(|(name, path, parent)| {
+                let label = if name_counts.get(&name).copied().unwrap_or(0) > 1 {
+                    format!("{} ({})", name, parent)
+                } else {
+                    name
+                };
+                (label, path)
+            })
+            .collect();
+        dev_dirs.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
 
         let filtered_dirs = dev_dirs.clone();
         let mut repo_list_state = ListState::default();
