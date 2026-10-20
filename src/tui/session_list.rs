@@ -561,13 +561,22 @@ impl SessionListScreen {
         self.switch_to_session(&key, manager)
     }
 
-    fn switch_to_session(&self, row_key: &str, manager: &Manager) -> ScreenAction {
+    fn switch_to_session(&mut self, row_key: &str, manager: &Manager) -> ScreenAction {
         let session = match self.session_for_row_key(row_key) {
             Some(s) => s,
             None => return ScreenAction::None,
         };
         if session.managed {
             if let Some(id) = session.id {
+                // Dead row: DB has the session but tmux doesn't. Recreate the
+                // tmux state from the worktree on disk before switching, so
+                // Enter is never a silent no-op.
+                if !session.live {
+                    if let Err(e) = manager.resurrect_session(id) {
+                        self.status_message = Some(format!("Could not resurrect: {}", e));
+                        return ScreenAction::None;
+                    }
+                }
                 manager.touch_session(id);
             }
         }
