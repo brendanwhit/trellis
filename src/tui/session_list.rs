@@ -8,7 +8,7 @@ use md5::{Md5, Digest};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
 
-use crate::claude_pane;
+use crate::agent_pane::{self, PaneStatus};
 use crate::fuzzy::fuzzy_match_multi;
 use crate::manager::Manager;
 use crate::models::{Repo, SessionInfo};
@@ -132,9 +132,9 @@ fn expanded_session_names(
 }
 
 /// Every tmux call the session list needs, in one place so it can run off the
-/// event loop. `expanded_names` limits pane capture to sessions whose windows
-/// are actually on screen. Also performs the claude-window auto-rename, since
-/// that reads conversation files and shells out to `tmux rename-window`.
+/// event loop. `expanded_names` limits status reads to sessions whose windows
+/// are actually on screen. Also performs the agent-window auto-rename, since
+/// that shells out to `tmux rename-window`.
 fn gather_snapshot(expanded_names: &HashSet<String>) -> TmuxSnapshot {
     let live = tmux::list_sessions();
     let mut windows = tmux::list_all_windows();
@@ -146,41 +146,53 @@ fn gather_snapshot(expanded_names: &HashSet<String>) -> TmuxSnapshot {
         }
         let Some(wins) = windows.get_mut(&session.name) else { continue };
         for win in wins.iter_mut() {
-            if win.command.is_empty() || !looks_like_claude_command(&win.command) {
-                continue;
+            let Some(status) = agent_pane::read_status(&win.pane_id) else { continue };
+            if window_name_is_default(win) {
+                try_rename_agent_window(&session.name, win, &status);
             }
-            if looks_like_claude_command(&win.name) {
-                try_rename_claude_window(&session.name, win);
-            }
-            let target = format!("{}:{}", session.name, win.index);
-            let state = claude_pane::classify_pane(&tmux::capture_pane(&target, 8));
-            pane_states.insert(target, state);
+            pane_states.insert(format!("{}:{}", session.name, win.index), status);
         }
     }
 
     TmuxSnapshot { live, windows, pane_states }
 }
 
-fn try_rename_claude_window(session_name: &str, win: &mut TmuxWindow) {
-    let session_id = match claude_pane::get_session_id(&win.pane_pid) {
-        Some(id) => id,
-        None => return,
-    };
-    let msg = match claude_pane::get_first_user_message(&session_id) {
-        Some(m) => m,
-        None => return,
-    };
-    let name = claude_pane::summarize_message(&msg, 4);
+/// A window still carries the name trellis gave it (or tmux's automatic
+/// command name) — i.e. nobody has renamed it to something meaningful yet.
+fn window_name_is_default(win: &TmuxWindow) -> bool {
+    win.name == crate::manager::AGENT_WINDOW || win.name == win.command
+}
+
+fn try_rename_agent_window(session_name: &str, win: &mut TmuxWindow, status: &PaneStatus) {
+    let Some(title) = status.title.as_deref() else { return };
+    let name = agent_pane::summarize_message(title, 4);
+    if name.is_empty() {
+        return;
+    }
     if tmux::rename_window(session_name, win.index, &name).is_ok() {
         win.name = name;
     }
 }
 
-/// Claude Code's pane_current_command reports as a version number (e.g. "0.1.42").
-/// We use this heuristic to detect Claude panes.
-fn looks_like_claude_command(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('.').collect();
-    parts.len() >= 3 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
+/// Open a new window in `session_name`, rooted at its active pane's cwd, and
+/// start the configured agent there with `args` appended.
+fn open_agent_window(
+    manager: &Manager,
+    session_name: &str,
+    window_name: &str,
+    args: &[&str],
+) -> Result<(), tmux::TmuxError> {
+    let cwd = tmux::session_active_pane_path(session_name);
+    // Target by window id: it stays unambiguous when another window in the
+    // session shares the name.
+    let window_id = tmux::new_window(session_name, window_name, cwd.as_deref())?;
+    let mut cmd = manager.agent_cmd();
+    for arg in args {
+        cmd.push(' ');
+        cmd.push_str(arg);
+    }
+    tmux::send_keys(&window_id, &[&cmd, "Enter"]);
+    Ok(())
 }
 
 /// If `session_name` is the calling client's currently attached session, switch
@@ -223,14 +235,14 @@ enum InlineMode {
 }
 
 /// Everything the session list needs from tmux. Gathered on a worker thread —
-/// it costs two process spawns plus one `capture-pane` per expanded Claude
-/// window, which used to run on the event loop for every keystroke.
+/// it costs two process spawns plus one status-file read per expanded window,
+/// which used to run on the event loop for every keystroke.
 #[derive(Default)]
 struct TmuxSnapshot {
     live: Vec<tmux::TmuxSession>,
     windows: HashMap<String, Vec<TmuxWindow>>,
-    /// "<session>:<window index>" -> classify_pane result.
-    pane_states: HashMap<String, &'static str>,
+    /// "<session>:<window index>" -> agent status, for windows running one.
+    pane_states: HashMap<String, PaneStatus>,
 }
 
 /// How often the snapshot is refreshed while the screen is idle.
@@ -580,12 +592,11 @@ impl SessionListScreen {
                             if win.path.starts_with(path) { Some(branch) } else { None }
                         })
                     });
-                    let is_claude = !win.command.is_empty() && looks_like_claude_command(&win.command);
+                    let key = format!("{}:{}", session.name, win.index);
 
                     let mut col_repo_child = Vec::new();
-                    if is_claude {
-                        let key = format!("{}:{}", session.name, win.index);
-                        match self.snapshot.pane_states.get(key.as_str()).copied().unwrap_or("") {
+                    if let Some(status) = self.snapshot.pane_states.get(key.as_str()) {
+                        match status.state.as_str() {
                             "working" => {
                                 col_repo_child.push(StyledSegment::new("✦ working…", Style::default().fg(theme::ORANGE)));
                             }
@@ -596,7 +607,10 @@ impl SessionListScreen {
                                 col_repo_child.push(StyledSegment::dim("✦ idle"));
                             }
                             _ => {
-                                col_repo_child.push(StyledSegment::new("✦ claude", Style::default().fg(theme::ORANGE)));
+                                col_repo_child.push(StyledSegment::new(
+                                    &format!("✦ {}", status.agent),
+                                    Style::default().fg(theme::ORANGE),
+                                ));
                             }
                         }
                     } else if !win.command.is_empty() && win.command != "zsh" {
@@ -1049,7 +1063,7 @@ impl SessionListScreen {
         }
     }
 
-    fn action_action_menu(&mut self, _manager: &Manager) -> ScreenAction {
+    fn action_action_menu(&mut self, manager: &Manager) -> ScreenAction {
         let key = match self.current_row_key() {
             Some(k) => k,
             None => return ScreenAction::None,
@@ -1071,7 +1085,7 @@ impl SessionListScreen {
             // "rename" removed — use `r` directly
             items.push(("branch".to_string(), "Change branch".to_string()));
             if session.live {
-                items.push(("claude".to_string(), "Launch claude".to_string()));
+                items.push(("agent".to_string(), format!("Launch {}", manager.agent_cmd())));
             }
         } else if session.live {
             items.push(("adopt".to_string(), "Adopt session".to_string()));
@@ -1089,33 +1103,24 @@ impl SessionListScreen {
         ScreenAction::None
     }
 
-    fn action_history(&self, manager: &Manager) -> ScreenAction {
-        let session = self.current_session();
-        let mut scope_paths = None;
-        let mut scope_label = None;
-
-        if let Some(s) = session {
-            if s.managed {
-                if let Some(repo_id) = s.repo_id {
-                    if let Some(repo) = self.repos.get(&repo_id) {
-                        let mut paths = vec![repo.path.clone()];
-                        if let Some(id) = s.id {
-                            for wt in manager.get_worktrees_for_session(id) {
-                                paths.push(wt.path.clone());
-                            }
-                            // Include worktrees root for this repo
-                            let wt_root = manager.worktrees_dir().join(&repo.name);
-                            paths.push(wt_root.to_string_lossy().to_string());
-                        }
-                        scope_paths = Some(paths);
-                        scope_label = Some(s.name.clone());
-                    }
-                }
+    /// Browse past conversations with the agent's own resume picker (`-c`'s
+    /// interactive sibling, `-r`), opened in a fresh window of the focused live
+    /// session so the picker is scoped to that session's working directory.
+    fn action_history(&mut self, manager: &Manager) -> ScreenAction {
+        let session = match self.current_session() {
+            Some(s) if s.live => s.clone(),
+            _ => {
+                self.status_message = Some("Select a live session to browse its history.".to_string());
+                return ScreenAction::None;
+            }
+        };
+        match open_agent_window(manager, &session.name, "resume", &["-r"]) {
+            Ok(()) => ScreenAction::Switch(SwitchAction::Session { target: session.name }),
+            Err(e) => {
+                self.status_message = Some(format!("Error: {}", e));
+                ScreenAction::None
             }
         }
-
-        let screen = super::history::HistoryScreen::new(manager, scope_paths, scope_label);
-        ScreenAction::Push(Box::new(screen))
     }
 
     fn action_cleanup(&self, manager: &Manager) -> ScreenAction {
@@ -1166,9 +1171,10 @@ impl SessionListScreen {
                     ScreenAction::None
                 }
             }
-            "claude" if session.live => {
-                if let Ok(window_id) = tmux::new_window(&session.name, "claude", None) {
-                    tmux::send_keys(&window_id, &["claude", "Enter"]);
+            "agent" if session.live => {
+                if let Err(e) = open_agent_window(manager, &session.name, crate::manager::AGENT_WINDOW, &[]) {
+                    self.status_message = Some(format!("Error: {}", e));
+                    return ScreenAction::None;
                 }
                 if session.managed {
                     if let Some(id) = session.id {
@@ -1390,17 +1396,16 @@ impl SessionListScreen {
                     _ => return ScreenAction::None,
                 };
                 if plain {
-                    let window_name = if input.is_empty() { "claude".to_string() } else { input.clone() };
-                    let cwd = tmux::session_active_pane_path(&session_name);
-                    self.inline_mode = InlineMode::None;
-                    let window_id = match tmux::new_window(&session_name, &window_name, cwd.as_deref()) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            self.status_message = Some(format!("Error: {}", e));
-                            return ScreenAction::None;
-                        }
+                    let window_name = if input.is_empty() {
+                        crate::manager::AGENT_WINDOW.to_string()
+                    } else {
+                        input.clone()
                     };
-                    tmux::send_keys(&window_id, &["claude", "Enter"]);
+                    self.inline_mode = InlineMode::None;
+                    if let Err(e) = open_agent_window(manager, &session_name, &window_name, &[]) {
+                        self.status_message = Some(format!("Error: {}", e));
+                        return ScreenAction::None;
+                    }
                     return ScreenAction::Switch(SwitchAction::Session { target: session_name });
                 }
                 if input.is_empty() {
@@ -1419,7 +1424,7 @@ impl SessionListScreen {
                     Ok(_) => {
                         tmux::send_keys(
                             &format!("{}:{}", session_name, input),
-                            &["claude", "Enter"],
+                            &[&manager.agent_cmd(), "Enter"],
                         );
                         ScreenAction::Switch(SwitchAction::Session {
                             target: session_name,
