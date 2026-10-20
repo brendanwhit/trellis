@@ -34,6 +34,16 @@ fn run(args: &[&str]) -> std::process::Output {
         .expect("failed to execute tmux")
 }
 
+/// Last `lines` rows of a pane's visible screen and scrollback, plain text.
+pub fn capture_pane(pane_id: &str, lines: u32) -> Option<String> {
+    let start = format!("-{}", lines);
+    let output = run(&["capture-pane", "-p", "-t", pane_id, "-S", &start]);
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[derive(Debug, Clone)]
 pub struct TmuxSession {
     pub name: String,
