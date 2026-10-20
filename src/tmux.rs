@@ -115,6 +115,7 @@ pub fn inside_tmux() -> bool {
     std::env::var("TMUX").is_ok()
 }
 
+<<<<<<< HEAD
 /// Return the working directory of the active pane in the given session, or
 /// None if tmux can't resolve it (session missing, no panes, etc.).
 pub fn session_active_pane_path(session: &str) -> Option<String> {
@@ -130,6 +131,24 @@ pub fn session_active_pane_path(session: &str) -> Option<String> {
 /// unambiguous when another window in the session shares its name.
 pub fn new_window(session: &str, name: &str, start_dir: Option<&str>) -> Result<String, TmuxError> {
     let mut args = vec!["new-window", "-t", session, "-n", name, "-P", "-F", "#{window_id}"];
+||||||| d6711c8
+pub fn new_window(session: &str, name: &str, start_dir: Option<&str>) -> Result<(), TmuxError> {
+    let mut args = vec!["new-window", "-t", session, "-n", name];
+=======
+/// Return the name of the session the calling client is currently attached
+/// to (i.e. the parent session when running inside `display-popup`).
+pub fn attached_session() -> Option<String> {
+    let output = run(&["display-message", "-p", "#S"]);
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+pub fn new_window(session: &str, name: &str, start_dir: Option<&str>) -> Result<(), TmuxError> {
+    let mut args = vec!["new-window", "-t", session, "-n", name];
+>>>>>>> pr/8
     if let Some(dir) = start_dir {
         args.extend_from_slice(&["-c", dir]);
     }
