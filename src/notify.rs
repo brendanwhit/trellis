@@ -129,6 +129,35 @@ fn decide(payload: &Payload, ask_model: impl FnOnce(&str) -> Option<bool>) -> Op
     }
 }
 
+/// Frontmost macOS app's pid, via `lsappinfo` (no accessibility permission needed).
+fn frontmost_pid() -> Option<u32> {
+    let out = |args: &[&str]| Command::new("lsappinfo").args(args).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let asn = out(&["front"])?;
+    let info = out(&["info", "-only", "pid", asn.trim()])?;
+    info.split("pid =").nth(1)?.split_whitespace().next()?.parse().ok()
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    let out = Command::new("ps").args(["-o", "ppid=", "-p", &pid.to_string()]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// A tmux client's pid followed by its parents, up to the terminal app that hosts it.
+fn ancestry(pid: u32) -> Vec<u32> {
+    let mut chain = vec![pid];
+    while let Some(parent) = parent_pid(*chain.last().unwrap()).filter(|p| *p > 1 && chain.len() < 16) {
+        chain.push(parent);
+    }
+    chain
+}
+
+/// Attached isn't watching: a client stays attached after its terminal loses
+/// focus. The pane must be on screen in a client whose terminal app is frontmost.
+/// With the frontmost app unknown, assume nobody is watching and ping.
+fn being_watched(visible: bool, client_ancestries: &[Vec<u32>], frontmost: Option<u32>) -> bool {
+    visible && frontmost.is_some_and(|front| client_ancestries.iter().any(|chain| chain.contains(&front)))
+}
+
 fn enabled(conn: &rusqlite::Connection) -> bool {
     db::get_config(conn, CONFIG_KEY).map_or(true, |v| !v.eq_ignore_ascii_case("off"))
 }
@@ -170,18 +199,18 @@ pub fn run(conn: &rusqlite::Connection) {
 
     let alert = decide(&payload, |reply| if ai { classify(reply) } else { None });
     // Feeds the row indicator, so it's recorded whether or not the ping is on
-    // or the session is attached.
+    // or you're watching the pane.
     if let (true, "Stop", Some(pane)) = (ai, payload.hook_event_name.as_str(), &pane) {
         agent_pane::write_verdict(pane, &payload.session_id, alert.is_some());
     }
 
     let (Some(alert), true, Some(pane)) = (alert, enabled(conn), pane) else { return };
-    let Some((session, attached)) = tmux::pane_session(&pane) else { return };
-    // You're already looking at it.
-    if attached {
+    let Some(view) = tmux::pane_view(&pane) else { return };
+    let ancestries: Vec<Vec<u32>> = view.client_pids.iter().map(|pid| ancestry(*pid)).collect();
+    if being_watched(view.visible, &ancestries, frontmost_pid()) {
         return;
     }
-    show(&session, &alert.body);
+    show(&view.session, &alert.body);
 }
 
 #[cfg(test)]
@@ -300,6 +329,31 @@ mod tests {
         assert!(!ai_enabled(&conn));
         db::set_config(&conn, AI_CONFIG_KEY, "on");
         assert!(ai_enabled(&conn));
+    }
+
+    #[test]
+    fn watched_only_when_visible_in_a_client_whose_terminal_is_frontmost() {
+        let clients = [vec![10, 20, 30], vec![11, 21]];
+        assert!(being_watched(true, &clients, Some(30)));
+        assert!(being_watched(true, &clients, Some(21)));
+        // Attached but another app has focus, or the pane is in a background window.
+        assert!(!being_watched(true, &clients, Some(99)));
+        assert!(!being_watched(false, &clients, Some(30)));
+        assert!(!being_watched(true, &[], Some(30)));
+        assert!(!being_watched(true, &clients, None));
+    }
+
+    // Needs a running tmux client and macOS: cargo test -- --ignored watched_live --nocapture
+    #[test]
+    #[ignore = "needs tmux + macOS"]
+    fn watched_live() {
+        let pane = std::env::var("TMUX_PANE").expect("run inside tmux");
+        let view = tmux::pane_view(&pane).unwrap();
+        let chains: Vec<Vec<u32>> = view.client_pids.iter().map(|p| ancestry(*p)).collect();
+        let front = frontmost_pid();
+        println!("visible={} front={front:?} chains={chains:?} watched={}", view.visible, being_watched(view.visible, &chains, front));
+        assert!(front.is_some());
+        assert!(chains.iter().all(|c| c.len() >= 2));
     }
 
     #[test]
