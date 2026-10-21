@@ -14,6 +14,7 @@ const CONFIG_KEYS: &[(&str, &str, bool)] = &[
     ("worktrees_dir", "Worktrees directory", false),
     ("agent_cmd", "Agent command (pi, omp, claude)", false),
     (crate::notify::CONFIG_KEY, "Ping when an agent needs input (on/off)", false),
+    (crate::notify::AI_CONFIG_KEY, "Ask Haiku whether a reply needs input (on/off)", false),
 ];
 
 struct Field {
