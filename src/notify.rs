@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::{db, tmux};
+use crate::{agent_pane, db, tmux};
 
 pub const CONFIG_KEY: &str = "notify";
 pub const AI_CONFIG_KEY: &str = "notify_ai";
@@ -33,6 +33,8 @@ struct Payload {
     message: String,
     #[serde(default)]
     last_assistant_message: String,
+    #[serde(default)]
+    session_id: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -153,16 +155,27 @@ fn show(session: &str, body: &str) {
 
 /// Hook entry point. Never fails the hook: a broken ping must not block Claude.
 pub fn run(conn: &rusqlite::Connection) {
-    if std::env::var_os(CHILD_ENV).is_some() || !enabled(conn) {
+    if std::env::var_os(CHILD_ENV).is_some() {
         return;
     }
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw).ok();
     let payload: Payload = serde_json::from_str(&raw).unwrap_or_default();
-
     let ai = ai_enabled(conn);
-    let Some(alert) = decide(&payload, |reply| if ai { classify(reply) } else { None }) else { return };
-    let Ok(pane) = std::env::var("TMUX_PANE") else { return };
+    let pane = std::env::var("TMUX_PANE").ok();
+    // A model verdict is only worth running when someone uses it: the ping or the indicator.
+    if !ai && !enabled(conn) {
+        return;
+    }
+
+    let alert = decide(&payload, |reply| if ai { classify(reply) } else { None });
+    // Feeds the row indicator, so it's recorded whether or not the ping is on
+    // or the session is attached.
+    if let (true, "Stop", Some(pane)) = (ai, payload.hook_event_name.as_str(), &pane) {
+        agent_pane::write_verdict(pane, &payload.session_id, alert.is_some());
+    }
+
+    let (Some(alert), true, Some(pane)) = (alert, enabled(conn), pane) else { return };
     let Some((session, attached)) = tmux::pane_session(&pane) else { return };
     // You're already looking at it.
     if attached {
