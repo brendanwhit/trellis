@@ -97,6 +97,8 @@ Claude Code needs no extension: panes without a trellis status file fall back to
 
 `Notification` covers permission and question dialogs; `Stop` catches replies that end in a plain-text question. Sessions you're attached to don't ping. Turn it off with the `notify` setting (`off`) in Settings (`S`).
 
+Set `notify_ai` to `on` to have Haiku judge replies the `?` check can't settle (a question mid-reply, "let me know if you want X"). It runs `claude -p --model haiku` on your existing login, only for those replies, and sends the end of the reply to Anthropic. Off by default; if the call fails or takes over 20s it falls back to the `?` check.
+
 ## Data
 
 Session and worktree metadata lives in `~/.local/share/trellis/trellis.db` (SQLite); agent status files live beside it in `panes/`. Worktrees are created at `<worktrees_dir>/<repo-name>/<branch-name>` (default `~/dev/worktrees/`). Both directories are configurable in settings.

@@ -41,6 +41,11 @@ pub fn init_db(db_path: &Path) -> Connection {
         params![crate::notify::CONFIG_KEY, "on"],
     )
     .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO config (key, value) VALUES (?1, ?2)",
+        params![crate::notify::AI_CONFIG_KEY, "off"],
+    )
+    .unwrap();
 
     conn
 }
