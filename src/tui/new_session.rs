@@ -1,12 +1,16 @@
 // trellis/src/tui/new_session.rs — multi-step wizard for creating a new session
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
-use crate::git;
+use crate::git::{self, GitError};
 use crate::manager::{self, Manager};
 use crate::tmux;
+use super::job::{Job, JobMsg};
 use super::path_complete::PathCompleter;
 use super::rename::{input_handle_key, render_input, render_modal_box};
 use super::{ScreenAction, ScreenBehavior};
@@ -37,6 +41,71 @@ fn agent_choices(default: &str) -> Vec<String> {
     agents
 }
 
+/// The GitHub calls behind PickRepo's remote entries, swappable so tests
+/// don't hit the network.
+#[derive(Clone, Copy)]
+struct Gh {
+    list_repos: fn() -> Result<Vec<String>, GitError>,
+    clone: fn(&str, &Path) -> Result<(), GitError>,
+}
+
+const REAL_GH: Gh = Gh {
+    list_repos: git::list_github_repos,
+    clone: git::clone_github_repo,
+};
+
+/// Drop remotes that a local repo's origin already covers.
+fn remote_only(remotes: Vec<String>, local_slugs: &HashSet<String>) -> Vec<String> {
+    remotes
+        .into_iter()
+        .filter(|r| !local_slugs.contains(&r.to_lowercase()))
+        .collect()
+}
+
+fn repo_name(slug: &str) -> &str {
+    slug.rsplit('/').next().unwrap_or(slug)
+}
+
+fn clone_dest(repos_dir: &Path, slug: &str) -> PathBuf {
+    repos_dir.join(repo_name(slug))
+}
+
+/// Append remote repos after the locals as `(label, slug)` entries and record
+/// their slugs. The slug doubles as the entry's "path" so the filter matches it
+/// and so it can't be mistaken for a (absolute) local path.
+fn merge_remote_entries(
+    dirs: &mut Vec<(String, String)>,
+    remote_slugs: &mut HashSet<String>,
+    remotes: Vec<String>,
+) {
+    let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let local_names = dirs.iter().map(|(_, p)| Path::new(p).file_name().unwrap_or_default().to_string_lossy().to_string());
+    for name in local_names.chain(remotes.iter().map(|r| repo_name(r).to_string())) {
+        *name_counts.entry(name).or_insert(0) += 1;
+    }
+    for slug in remotes {
+        let name = repo_name(&slug);
+        let label = if name_counts.get(name).copied().unwrap_or(0) > 1 {
+            format!("{} (remote)", slug)
+        } else {
+            format!("{} (remote)", name)
+        };
+        remote_slugs.insert(slug.clone());
+        dirs.push((label, slug));
+    }
+}
+
+/// Reuse an existing checkout at `dest` rather than failing the clone.
+fn clone_or_reuse(gh: Gh, slug: &str, dest: &Path) -> Result<SelectedRepo, String> {
+    if !dest.join(".git").exists() {
+        (gh.clone)(slug, dest).map_err(|e| e.to_string())?;
+    }
+    Ok(SelectedRepo {
+        name: repo_name(slug).to_string(),
+        path: dest.to_string_lossy().to_string(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // NewSessionScreen
 // ---------------------------------------------------------------------------
@@ -47,6 +116,11 @@ pub struct NewSessionScreen {
     // Repo step
     dev_dirs: Vec<(String, String)>, // (name, path)
     filtered_dirs: Vec<(String, String)>,
+    /// Slugs of `dev_dirs` entries that are GitHub repos not yet cloned.
+    remote_slugs: HashSet<String>,
+    gh: Gh,
+    fetch_job: Option<Job<Result<Vec<String>, String>>>,
+    clone_job: Option<Job<Result<SelectedRepo, String>>>,
     repo_list_state: ListState,
     awaiting_repo_path: bool,
     path_completer: PathCompleter,
@@ -81,6 +155,10 @@ pub struct NewSessionScreen {
 
 impl NewSessionScreen {
     pub fn new(manager: &Manager) -> Self {
+        Self::new_with(manager, REAL_GH)
+    }
+
+    fn new_with(manager: &Manager, gh: Gh) -> Self {
         let repos_dirs = manager.repos_dirs();
         let worktrees_dir = manager.worktrees_dir();
 
@@ -127,10 +205,28 @@ impl NewSessionScreen {
             repo_list_state.select(Some(0));
         }
 
+        let local_paths: Vec<String> = dev_dirs.iter().map(|(_, p)| p.clone()).collect();
+        let fetch_job = Job::spawn("Loading GitHub repos", None, move |tx| {
+            let result = (gh.list_repos)().map_err(|e| e.to_string()).map(|remotes| {
+                let local_slugs = local_paths
+                    .iter()
+                    .filter_map(|p| git::origin_github_slug(p))
+                    .map(|s| s.to_lowercase())
+                    .collect();
+                remote_only(remotes, &local_slugs)
+            });
+            let _ = tx.send(JobMsg::Item(result));
+            let _ = tx.send(JobMsg::Done);
+        });
+
         Self {
             step: Step::PickRepo,
             dev_dirs,
             filtered_dirs,
+            remote_slugs: HashSet::new(),
+            gh,
+            fetch_job: Some(fetch_job),
+            clone_job: None,
             repo_list_state,
             awaiting_repo_path: false,
             path_completer: PathCompleter::default(),
@@ -292,6 +388,72 @@ impl NewSessionScreen {
     }
 
     // ------------------------------------------------------------------
+    // Background results
+    // ------------------------------------------------------------------
+
+    /// Add remote repos to the list, keeping the filter text and highlighted entry.
+    fn merge_remotes(&mut self, remotes: Vec<String>) {
+        let highlighted = self
+            .repo_list_state
+            .selected()
+            .and_then(|i| self.filtered_dirs.get(i))
+            .map(|(_, p)| p.clone());
+        merge_remote_entries(&mut self.dev_dirs, &mut self.remote_slugs, remotes);
+        self.apply_filter();
+        if let Some(i) = highlighted.and_then(|h| self.filtered_dirs.iter().position(|(_, p)| *p == h)) {
+            self.repo_list_state.select(Some(i));
+        }
+    }
+
+    fn apply_fetch_results(&mut self) {
+        let Some(job) = self.fetch_job.as_mut() else {
+            return;
+        };
+        let result = job.drain().pop();
+        if result.is_none() && !job.finished() {
+            return;
+        }
+        self.fetch_job = None;
+        match result {
+            Some(Ok(remotes)) => self.merge_remotes(remotes),
+            // The wizard works without GitHub; say why the remote entries are missing.
+            Some(Err(e)) if self.step == Step::PickRepo => {
+                self.error = format!("GitHub repos unavailable: {}", e)
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_clone_results(&mut self) {
+        let Some(job) = self.clone_job.as_mut() else {
+            return;
+        };
+        let result = job.drain().pop();
+        if result.is_none() && !job.finished() {
+            return;
+        }
+        self.clone_job = None;
+        match result {
+            Some(Ok(repo)) => {
+                self.selected_repo = Some(repo);
+                self.go_to_branch_step();
+            }
+            Some(Err(e)) => self.error = e,
+            None => self.error = "Clone failed.".to_string(),
+        }
+    }
+
+    fn start_clone(&mut self, manager: &Manager, slug: String) {
+        let dest = clone_dest(&manager.repos_dirs()[0], &slug);
+        let gh = self.gh;
+        self.error.clear();
+        self.clone_job = Some(Job::spawn(format!("Cloning {}", slug), None, move |tx| {
+            let _ = tx.send(JobMsg::Item(clone_or_reuse(gh, &slug, &dest)));
+            let _ = tx.send(JobMsg::Done);
+        }));
+    }
+
+    // ------------------------------------------------------------------
     // Path entry mode
     // ------------------------------------------------------------------
 
@@ -338,8 +500,11 @@ impl NewSessionScreen {
                         best.map(|score| ((n.clone(), p.clone()), score))
                     })
                     .collect();
+                // Remotes sort after locals on equal score.
                 scored.sort_by(|a, b| {
-                    a.1.cmp(&b.1).then_with(|| a.0 .0.to_lowercase().cmp(&b.0 .0.to_lowercase()))
+                    a.1.cmp(&b.1)
+                        .then_with(|| self.remote_slugs.contains(&a.0 .1).cmp(&self.remote_slugs.contains(&b.0 .1)))
+                        .then_with(|| a.0 .0.to_lowercase().cmp(&b.0 .0.to_lowercase()))
                 });
                 self.filtered_dirs = scored.into_iter().map(|((n, p), _)| (n, p)).collect();
                 self.repo_list_state = ListState::default();
@@ -458,6 +623,10 @@ impl NewSessionScreen {
             return ScreenAction::None;
         }
         let (name, path) = self.filtered_dirs[idx].clone();
+        if self.remote_slugs.contains(&path) {
+            self.start_clone(manager, path);
+            return ScreenAction::None;
+        }
         self.selected_repo = Some(SelectedRepo { name, path });
         self.go_to_branch_step();
         ScreenAction::None
@@ -667,15 +836,31 @@ impl ScreenBehavior for NewSessionScreen {
             self.path_completer.render(f, chunks[4]);
         }
 
-        // Error
+        // Error, else background-work indicator
         if !self.error.is_empty() {
             let err = Paragraph::new(Span::styled(&self.error[..], theme::style_error()))
                 .alignment(Alignment::Center);
             f.render_widget(err, chunks[5]);
+        } else if let Some(line) = self
+            .clone_job
+            .as_ref()
+            .map(|j| j.indicator_line())
+            .or_else(|| self.fetch_job.as_ref().map(|j| j.indicator_line()))
+        {
+            f.render_widget(Paragraph::new(line).alignment(Alignment::Center), chunks[5]);
         }
     }
 
+    fn tick(&mut self, _manager: &mut Manager) -> ScreenAction {
+        self.apply_fetch_results();
+        self.apply_clone_results();
+        ScreenAction::None
+    }
+
     fn handle_event(&mut self, event: &Event, manager: &mut Manager) -> ScreenAction {
+        if self.clone_job.is_some() {
+            return ScreenAction::None;
+        }
         if let Event::Key(KeyEvent { code, kind: KeyEventKind::Press, modifiers, .. }) = event {
             if !matches!(code, KeyCode::Tab | KeyCode::BackTab) {
                 self.path_completer.reset();
@@ -777,8 +962,126 @@ impl ScreenBehavior for NewSessionScreen {
 
 #[cfg(test)]
 mod tests {
-    use super::agent_choices;
+    use super::*;
     use crate::fuzzy::fuzzy_match_multi;
+    use crate::git::GitError;
+
+    #[test]
+    fn remote_only_drops_repos_that_match_a_local_origin_case_insensitively() {
+        let locals: HashSet<String> = ["faradayio/aviary".to_string()].into();
+        let remotes = vec!["FaradayIO/Aviary".to_string(), "faradayio/other".to_string()];
+        let kept = remote_only(remotes, &locals);
+        assert_eq!(kept, vec!["faradayio/other".to_string()]);
+    }
+
+    #[test]
+    fn clone_dest_is_repos_dir_joined_with_repo_name() {
+        let dest = clone_dest(Path::new("/dev"), "faradayio/aviary");
+        assert_eq!(dest, Path::new("/dev/aviary"));
+    }
+
+    fn entries() -> (Vec<(String, String)>, HashSet<String>) {
+        let mut dirs = vec![
+            ("zeta".to_string(), "/dev/zeta".to_string()),
+            ("aviary".to_string(), "/dev/aviary".to_string()),
+        ];
+        let mut slugs = HashSet::new();
+        merge_remote_entries(
+            &mut dirs,
+            &mut slugs,
+            vec!["o/alpha".to_string(), "o/aviary".to_string(), "p/alpha".to_string()],
+        );
+        (dirs, slugs)
+    }
+
+    #[test]
+    fn merged_remotes_follow_locals_and_are_tagged_and_selectable() {
+        let (dirs, slugs) = entries();
+        assert_eq!(slugs.len(), 3);
+        let first_remote = dirs.iter().position(|(_, p)| slugs.contains(p)).unwrap();
+        assert!(dirs[..first_remote].iter().all(|(_, p)| !slugs.contains(p)));
+        assert!(dirs[first_remote..].iter().all(|(_, p)| slugs.contains(p)));
+        for (label, path) in &dirs[first_remote..] {
+            assert!(label.ends_with("(remote)"), "{label}");
+            assert!(path.contains('/') && !path.starts_with('/'), "{path}");
+        }
+    }
+
+    #[test]
+    fn colliding_remote_names_fall_back_to_owner_qualified_labels() {
+        let (dirs, _) = entries();
+        let labels: Vec<&str> = dirs.iter().map(|(l, _)| l.as_str()).collect();
+        let unique: HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(unique.len(), labels.len(), "labels must be distinguishable: {labels:?}");
+    }
+
+    fn gh_ok_listing() -> Gh {
+        Gh {
+            list_repos: || Ok(vec!["o/remote-one".to_string()]),
+            clone: |_, dest| {
+                std::fs::create_dir_all(dest.join(".git")).map_err(|e| GitError(e.to_string()))
+            },
+        }
+    }
+
+    fn screen_with(gh: Gh) -> (NewSessionScreen, Manager, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_schema(&conn);
+        let manager = Manager::new(conn);
+        manager.set_config("repos_dir", tmp.path().to_str().unwrap());
+        (NewSessionScreen::new_with(&manager, gh), manager, tmp)
+    }
+
+    fn settle(screen: &mut NewSessionScreen, manager: &mut Manager, done: impl Fn(&NewSessionScreen) -> bool) {
+        while !done(screen) {
+            screen.tick(manager);
+            std::thread::yield_now();
+        }
+    }
+
+    fn press_enter(screen: &mut NewSessionScreen, manager: &mut Manager) {
+        let ev = Event::Key(KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE));
+        screen.handle_event(&ev, manager);
+    }
+
+    #[test]
+    fn fetched_remotes_merge_into_the_visible_list_and_picking_one_clones_then_advances() {
+        let (mut screen, mut manager, tmp) = screen_with(gh_ok_listing());
+        assert!(screen.filtered_dirs.is_empty(), "list opens local-only");
+
+        settle(&mut screen, &mut manager, |s| s.fetch_job.is_none());
+        assert_eq!(screen.filtered_dirs.len(), 1);
+        assert!(screen.remote_slugs.contains(&screen.filtered_dirs[0].1));
+
+        press_enter(&mut screen, &mut manager);
+        assert!(screen.clone_job.is_some(), "remote pick must start a clone, not advance");
+        assert_eq!(screen.step, Step::PickRepo);
+
+        settle(&mut screen, &mut manager, |s| s.clone_job.is_none());
+        assert_eq!(screen.step, Step::PickBranch);
+        let repo = screen.selected_repo.as_ref().unwrap();
+        assert_eq!(Path::new(&repo.path), tmp.path().join("remote-one"));
+    }
+
+    #[test]
+    fn failed_listing_leaves_the_local_list_with_a_notice_and_failed_clone_stays_on_pick_repo() {
+        let gh = Gh {
+            list_repos: || Err(GitError("not logged in".into())),
+            clone: |_, _| Err(GitError("boom".into())),
+        };
+        let (mut screen, mut manager, _tmp) = screen_with(gh);
+        settle(&mut screen, &mut manager, |s| s.fetch_job.is_none());
+        assert!(screen.filtered_dirs.is_empty());
+        assert!(screen.error.contains("not logged in"));
+
+        screen.merge_remotes(vec!["o/x".to_string()]);
+        screen.error.clear();
+        press_enter(&mut screen, &mut manager);
+        settle(&mut screen, &mut manager, |s| s.clone_job.is_none());
+        assert_eq!(screen.step, Step::PickRepo);
+        assert!(screen.error.contains("boom"));
+    }
 
     #[test]
     fn agent_choices_always_include_the_default_exactly_once() {

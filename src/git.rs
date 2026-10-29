@@ -262,6 +262,79 @@ pub fn get_pr_branch(repo_path: &str, pr_number: i64) -> Result<String, GitError
     Ok(branch)
 }
 
+fn gh_stdout(args: &[&str]) -> Result<String, GitError> {
+    let output = Command::new("gh")
+        .args(args)
+        .output()
+        .map_err(|e| GitError(format!("gh: {}", e)))?;
+    if !output.status.success() {
+        return Err(GitError(format!(
+            "gh {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// `owner/name` for a GitHub remote URL (ssh or https, with or without `.git`).
+pub fn parse_github_slug(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let rest = [
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "https://github.com/",
+        "http://github.com/",
+        "git://github.com/",
+    ]
+    .iter()
+    .find_map(|p| url.strip_prefix(p))?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut parts = rest.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty() => {
+            Some(format!("{}/{}", owner, name))
+        }
+        _ => None,
+    }
+}
+
+/// `owner/name` of the repo's `origin` remote, if it is a GitHub URL.
+pub fn origin_github_slug(repo_path: &str) -> Option<String> {
+    let output = run(&["remote", "get-url", "origin"], Some(repo_path));
+    if !output.status.success() {
+        return None;
+    }
+    parse_github_slug(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Every non-archived repo (`owner/name`) of the authenticated GitHub user and
+/// their orgs. An owner whose listing fails (e.g. SAML) is skipped.
+pub fn list_github_repos() -> Result<Vec<String>, GitError> {
+    let login = gh_stdout(&["api", "user", "--jq", ".login"])?;
+    let orgs = gh_stdout(&["api", "user/orgs", "--paginate", "--jq", ".[].login"])?;
+    let mut repos = Vec::new();
+    for owner in std::iter::once(login.trim()).chain(orgs.lines().map(str::trim)) {
+        if owner.is_empty() {
+            continue;
+        }
+        let listing = gh_stdout(&[
+            "repo", "list", owner, "--limit", "1000", "--no-archived",
+            "--json", "nameWithOwner", "--jq", ".[].nameWithOwner",
+        ]);
+        if let Ok(listing) = listing {
+            repos.extend(listing.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()));
+        }
+    }
+    repos.sort();
+    repos.dedup();
+    Ok(repos)
+}
+
+pub fn clone_github_repo(slug: &str, dest: &Path) -> Result<(), GitError> {
+    gh_stdout(&["repo", "clone", slug, &dest.to_string_lossy()]).map(|_| ())
+}
+
 pub fn fetch_origin(repo_path: &str) -> Result<(), GitError> {
     let fetch = run(&["fetch", "origin"], Some(repo_path));
     if !fetch.status.success() {
@@ -342,6 +415,34 @@ pub(crate) mod tests {
         Command::new("git").args(["config", "user.name", "t"]).current_dir(dir).output().unwrap();
         Command::new("git").args(["commit", "--allow-empty", "-qm", "init"]).current_dir(dir).output().unwrap();
         Command::new("git").args(["branch", "-M", "main"]).current_dir(dir).output().unwrap();
+    }
+
+    #[test]
+    fn parse_github_slug_handles_common_remote_forms() {
+        for url in [
+            "git@github.com:faradayio/aviary.git",
+            "git@github.com:faradayio/aviary",
+            "https://github.com/faradayio/aviary.git",
+            "https://github.com/faradayio/aviary",
+            "https://github.com/faradayio/aviary/",
+            "ssh://git@github.com/faradayio/aviary.git",
+        ] {
+            assert_eq!(parse_github_slug(url).as_deref(), Some("faradayio/aviary"), "{url}");
+        }
+    }
+
+    #[test]
+    fn parse_github_slug_rejects_non_github_or_malformed_urls() {
+        for url in [
+            "",
+            "/Users/me/dev/aviary",
+            "git@gitlab.com:faradayio/aviary.git",
+            "https://github.com/faradayio",
+            "https://github.com/a/b/c",
+            "git@github.com:/aviary.git",
+        ] {
+            assert_eq!(parse_github_slug(url), None, "{url}");
+        }
     }
 
     #[test]
