@@ -131,23 +131,86 @@ fn expanded_session_names(
         .collect()
 }
 
+/// Agent state rolled up across a session's windows, ordered by urgency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AgentRollup {
+    Idle,
+    Working,
+    NeedsInput,
+}
+
+fn session_agent_rollup(snapshot: &TmuxSnapshot, session_name: &str) -> Option<AgentRollup> {
+    snapshot
+        .windows
+        .get(session_name)?
+        .iter()
+        .filter_map(|win| snapshot.pane_states.get(&format!("{}:{}", session_name, win.index)))
+        .filter_map(|status| match status.state.as_str() {
+            "prompting" => Some(AgentRollup::NeedsInput),
+            "working" => Some(AgentRollup::Working),
+            "idle" => Some(AgentRollup::Idle),
+            _ => None,
+        })
+        .max()
+}
+
+/// Glyph and color for a session row's leading indicator; `None` color is dim.
+/// Agent status wins over the managed/unmanaged markers.
+fn row_marker(live: bool, managed: bool, rollup: Option<AgentRollup>) -> (&'static str, Option<Color>) {
+    match (live, rollup) {
+        (true, Some(AgentRollup::NeedsInput)) => ("!", Some(theme::RED)),
+        (true, Some(AgentRollup::Working)) => ("◆", Some(theme::ORANGE)),
+        (true, Some(AgentRollup::Idle)) => ("●", Some(theme::GREEN)),
+        _ if !managed => ("◇", None),
+        (true, None) => ("○", None),
+        (false, _) => (" ", None),
+    }
+}
+
+fn marker_segment(marker: (&'static str, Option<Color>)) -> StyledSegment {
+    match marker {
+        (glyph, Some(color)) => StyledSegment::new(glyph, Style::default().fg(color)),
+        (glyph, None) => StyledSegment::dim(glyph),
+    }
+}
+
+/// One-line key for the row indicators, built from `row_marker` so the two
+/// can't drift.
+fn status_legend() -> Paragraph<'static> {
+    let entries = [
+        (row_marker(true, true, Some(AgentRollup::NeedsInput)), "needs input"),
+        (row_marker(true, true, Some(AgentRollup::Working)), "working"),
+        (row_marker(true, true, Some(AgentRollup::Idle)), "idle"),
+        (row_marker(true, true, None), "no agent"),
+        (row_marker(true, false, None), "unmanaged"),
+    ];
+    let mut spans = vec![Span::raw(" ")];
+    for (i, ((glyph, color), label)) in entries.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = color.map(|c| Style::default().fg(c)).unwrap_or_else(theme::style_dim);
+        spans.push(Span::styled(glyph, style));
+        spans.push(Span::styled(format!(" {}", label), Style::default().fg(theme::TEXT_DIM)));
+    }
+    Paragraph::new(Line::from(spans))
+}
+
 /// Every tmux call the session list needs, in one place so it can run off the
-/// event loop. `expanded_names` limits status reads to sessions whose windows
-/// are actually on screen. Also performs the agent-window auto-rename, since
-/// that shells out to `tmux rename-window`.
+/// event loop. Status is read for every live session because collapsed rows
+/// show a rolled-up indicator. The agent-window auto-rename (which shells out to
+/// `tmux rename-window`) is limited to `expanded_names`, the sessions whose
+/// windows are on screen.
 fn gather_snapshot(expanded_names: &HashSet<String>) -> TmuxSnapshot {
     let live = tmux::list_sessions();
     let mut windows = tmux::list_all_windows();
     let mut pane_states = HashMap::new();
 
     for session in &live {
-        if !expanded_names.contains(&session.name) {
-            continue;
-        }
         let Some(wins) = windows.get_mut(&session.name) else { continue };
         for win in wins.iter_mut() {
             let Some(status) = agent_pane::read_status(&win.pane_id) else { continue };
-            if window_name_is_default(win) {
+            if expanded_names.contains(&session.name) && window_name_is_default(win) {
                 try_rename_agent_window(&session.name, win, &status);
             }
             pane_states.insert(format!("{}:{}", session.name, win.index), status);
@@ -246,6 +309,25 @@ struct TmuxSnapshot {
 }
 
 /// How often the snapshot is refreshed while the screen is idle.
+const FOOTER_BINDINGS: [(&str, &str); 16] = [
+    ("q", "Quit"),
+    ("/", "Filter"),
+    ("enter", "Switch"),
+    ("h/l", "Collapse/Expand"),
+    ("n", "New"),
+    ("t", "Tab"),
+    ("T", "Plain tab"),
+    ("r", "Rename"),
+    ("R", "Review"),
+    ("d", "Delete"),
+    ("H", "History"),
+    (".", "Actions"),
+    ("c", "Cleanup"),
+    ("A", "Adopt"),
+    ("S", "Settings"),
+    ("?", "Help"),
+];
+
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 pub struct SessionListScreen {
@@ -498,15 +580,8 @@ impl SessionListScreen {
             let mut col_session = Vec::new();
 
             // Status indicator
-            if session.attached {
-                col_session.push(StyledSegment::new("●", Style::default().fg(theme::GREEN)));
-            } else if !session.managed {
-                col_session.push(StyledSegment::dim("◇"));
-            } else if session.live {
-                col_session.push(StyledSegment::new("○", Style::default().fg(theme::BLUE)));
-            } else {
-                col_session.push(StyledSegment::plain(" "));
-            }
+            let rollup = session_agent_rollup(&self.snapshot, &session.name);
+            col_session.push(marker_segment(row_marker(session.live, session.managed, rollup)));
 
             col_session.push(StyledSegment::plain(" "));
 
@@ -1197,27 +1272,6 @@ impl SessionListScreen {
         }
     }
 
-    fn render_footer<'a>(&self) -> Paragraph<'a> {
-        super::rename::render_footer_bindings(&[
-            ("q", "Quit"),
-            ("/", "Filter"),
-            ("enter", "Switch"),
-            ("h/l", "Collapse/Expand"),
-            ("n", "New"),
-            ("t", "Tab"),
-            ("T", "Plain tab"),
-            ("r", "Rename"),
-            ("R", "Review"),
-            ("d", "Delete"),
-            ("H", "History"),
-            (".", "Actions"),
-            ("c", "Cleanup"),
-            ("A", "Adopt"),
-            ("S", "Settings"),
-            ("?", "Help"),
-        ])
-    }
-
     fn handle_rename_key(&mut self, code: KeyCode, modifiers: crossterm::event::KeyModifiers, manager: &mut Manager) -> ScreenAction {
         let (input, _cursor, is_session, session_id, session_name, window_index) = match &mut self.inline_mode {
             InlineMode::Rename { input, cursor, is_session, session_id, session_name, window_index } => {
@@ -1512,7 +1566,7 @@ impl ScreenBehavior for SessionListScreen {
     }
 
     fn render(&self, f: &mut Frame, area: Rect, _manager: &Manager) {
-        // Layout: optional filter at top, table in middle, footer at bottom
+        // Layout: status key, optional filter, table, optional status, footer
         let has_filter = self.filter_active || !self.filter.is_empty();
         let filter_height = if has_filter { 1 } else { 0 };
 
@@ -1526,15 +1580,21 @@ impl ScreenBehavior for SessionListScreen {
             _ => 1,
         };
 
+        let footer_lines = super::rename::footer_lines(&FOOTER_BINDINGS, area.width);
+        let footer_height = footer_lines.len() as u16;
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(1),
                 Constraint::Length(filter_height),
                 Constraint::Min(0),
                 Constraint::Length(status_height),
-                Constraint::Length(1),
+                Constraint::Length(footer_height),
             ])
             .split(area);
+
+        f.render_widget(status_legend(), chunks[0]);
 
         // Filter bar
         if has_filter {
@@ -1545,13 +1605,13 @@ impl ScreenBehavior for SessionListScreen {
                 Style::default().fg(theme::TEXT_DIM).bg(theme::HEADER_BG)
             };
             let filter_widget = Paragraph::new(filter_text).style(filter_style);
-            f.render_widget(filter_widget, chunks[0]);
+            f.render_widget(filter_widget, chunks[1]);
         }
 
         // Background work indicator (PR review fetch)
         if let Some(ref job) = self.review_job {
             let indicator = Paragraph::new(job.indicator_line()).style(Style::default().bg(theme::BG));
-            f.render_widget(indicator, chunks[2]);
+            f.render_widget(indicator, chunks[3]);
         }
 
         // Build table rows
@@ -1584,7 +1644,7 @@ impl ScreenBehavior for SessionListScreen {
             .block(Block::default().style(theme::style_default()));
 
         let mut state = self.table_state.clone();
-        f.render_stateful_widget(table, chunks[1], &mut state);
+        f.render_stateful_widget(table, chunks[2], &mut state);
 
         // Status line
         match &self.inline_mode {
@@ -1593,13 +1653,13 @@ impl ScreenBehavior for SessionListScreen {
                     let status = Paragraph::new(msg.as_str())
                         .style(Style::default().fg(theme::TEXT_DIM).bg(theme::BG))
                         .wrap(Wrap { trim: false });
-                    f.render_widget(status, chunks[2]);
+                    f.render_widget(status, chunks[3]);
                 }
             }
             InlineMode::Confirm { message, .. } => {
                 let status = Paragraph::new(message.as_str())
                     .style(Style::default().fg(theme::YELLOW).bg(theme::BG));
-                f.render_widget(status, chunks[2]);
+                f.render_widget(status, chunks[3]);
             }
             InlineMode::Working { .. } => {
                 // Overlay is rendered at the end of this method.
@@ -1608,12 +1668,12 @@ impl ScreenBehavior for SessionListScreen {
                 // Show input hint in status line
                 let hint = Paragraph::new("[enter] confirm  [esc] cancel")
                     .style(Style::default().fg(theme::TEXT_DIM).bg(theme::BG));
-                f.render_widget(hint, chunks[2]);
+                f.render_widget(hint, chunks[3]);
 
                 // Overlay input on the current row's Session column
                 // The session column has a prefix: "● ▸ " (status + expand = 4 chars)
                 // We overlay the entire session column to cover the old text including "(N)" count
-                let table_area = chunks[1];
+                let table_area = chunks[2];
                 let selected = self.table_state.selected().unwrap_or(0);
                 let scroll_offset = self.table_state.offset();
                 let visible_row = selected - scroll_offset;
@@ -1693,7 +1753,7 @@ impl ScreenBehavior for SessionListScreen {
                     Span::styled(suffix, Style::default().fg(theme::TEXT_DIM)),
                 ];
                 let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG));
-                f.render_widget(status, chunks[2]);
+                f.render_widget(status, chunks[3]);
             }
             InlineMode::NewTab { ref input, cursor: cursor_pos, ref session_name, plain, .. } => {
                 let prefix = if *plain {
@@ -1720,16 +1780,16 @@ impl ScreenBehavior for SessionListScreen {
                     Span::styled(suffix, Style::default().fg(theme::TEXT_DIM)),
                 ];
                 let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG));
-                f.render_widget(status, chunks[2]);
+                f.render_widget(status, chunks[3]);
             }
             InlineMode::ActionMenu { ref items, cursor: menu_cursor } => {
                 // Draw hint in status line
                 let hint = Paragraph::new("[j/k] navigate  [enter] select  [esc] cancel")
                     .style(Style::default().fg(theme::TEXT_DIM).bg(theme::BG));
-                f.render_widget(hint, chunks[2]);
+                f.render_widget(hint, chunks[3]);
 
                 // Calculate dropdown position anchored to cursor row
-                let table_area = chunks[1];
+                let table_area = chunks[2];
                 let selected = self.table_state.selected().unwrap_or(0);
                 let scroll_offset = self.table_state.offset();
                 let visible_row = selected - scroll_offset;
@@ -1780,8 +1840,7 @@ impl ScreenBehavior for SessionListScreen {
         }
 
         // Footer
-        let footer = self.render_footer();
-        f.render_widget(footer, chunks[3]);
+        f.render_widget(Paragraph::new(footer_lines).style(theme::style_footer()), chunks[4]);
 
         if let InlineMode::Working { action } = &self.inline_mode {
             let label = match action {
@@ -1978,5 +2037,68 @@ mod tests {
             let names = expanded_session_names(std::slice::from_ref(&s), &keys);
             assert_eq!(names, [s.name.clone()].into_iter().collect());
         }
+    }
+
+    fn snapshot_with(states: &[(&str, i64, &str)]) -> TmuxSnapshot {
+        let mut snap = TmuxSnapshot::default();
+        for (session, index, state) in states {
+            snap.windows.entry(session.to_string()).or_default().push(TmuxWindow {
+                index: *index,
+                name: String::new(),
+                path: String::new(),
+                command: String::new(),
+                pane_id: format!("%{}", index),
+            });
+            snap.pane_states.insert(
+                format!("{}:{}", session, index),
+                PaneStatus { agent: "claude".into(), pid: 1, state: state.to_string(), title: None },
+            );
+        }
+        snap
+    }
+
+    #[test]
+    fn rollup_takes_the_most_urgent_agent_state_in_the_session() {
+        for (states, expected) in [
+            (vec!["idle", "idle"], AgentRollup::Idle),
+            (vec!["idle", "working"], AgentRollup::Working),
+            (vec!["working", "prompting", "idle"], AgentRollup::NeedsInput),
+        ] {
+            let rows: Vec<(&str, i64, &str)> =
+                states.iter().enumerate().map(|(i, st)| ("s", i as i64, *st)).collect();
+            assert_eq!(session_agent_rollup(&snapshot_with(&rows), "s"), Some(expected));
+        }
+    }
+
+    #[test]
+    fn rollup_ignores_other_sessions_unknown_states_and_agentless_sessions() {
+        let snap = snapshot_with(&[("other", 0, "prompting"), ("s", 0, "mystery")]);
+        assert_eq!(session_agent_rollup(&snap, "s"), None);
+        assert_eq!(session_agent_rollup(&snap, "absent"), None);
+    }
+
+    #[test]
+    fn agent_status_outranks_unmanaged_and_not_live_markers() {
+        let glyph = |live, managed, r| row_marker(live, managed, r).0;
+        assert_eq!(glyph(true, false, Some(AgentRollup::NeedsInput)), "!");
+        assert_eq!(glyph(true, true, Some(AgentRollup::Working)), "◆");
+        assert_eq!(glyph(true, true, Some(AgentRollup::Idle)), "●");
+        assert_eq!(glyph(true, true, None), "○");
+        assert_eq!(glyph(true, false, None), "◇");
+        assert_eq!(glyph(false, true, Some(AgentRollup::Working)), " ");
+    }
+
+    #[test]
+    fn every_status_has_a_distinct_glyph() {
+        let glyphs: HashSet<&str> = [
+            row_marker(true, true, Some(AgentRollup::NeedsInput)).0,
+            row_marker(true, true, Some(AgentRollup::Working)).0,
+            row_marker(true, true, Some(AgentRollup::Idle)).0,
+            row_marker(true, true, None).0,
+            row_marker(true, false, None).0,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(glyphs.len(), 5);
     }
 }
