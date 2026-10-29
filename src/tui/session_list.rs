@@ -2051,7 +2051,7 @@ mod tests {
             });
             snap.pane_states.insert(
                 format!("{}:{}", session, index),
-                PaneStatus { agent: "claude".into(), pid: 1, state: state.to_string(), title: None },
+                PaneStatus { agent: "claude".into(), pid: 1, state: state.to_string(), title: None, turn: None },
             );
         }
         snap
