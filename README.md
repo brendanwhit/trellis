@@ -52,7 +52,7 @@ Claude Code needs no extension: panes without a trellis status file fall back to
 
 **New tab** (`t`) creates a worktree branching from the session's branch and launches the agent in it.
 
-**PR review** (`R`) takes a PR number or branch name (via `gh`), fetches it, creates a worktree and session, launches the agent, and switches to it.
+**Reviewing a branch or PR**: in the New session wizard (`n`, or `R` to start on your most recently used repo) the branch list includes remote-only branches (tagged `(remote)`); type a PR number to review that PR. Trellis fetches the branch, creates a worktree at `origin/<branch>`, launches the agent, and switches to it.
 
 **History** (`H`) opens the agent's own resume picker (`<agent> -r`) in a new window of the selected live session, scoped to that session's directory.
 
@@ -73,7 +73,7 @@ Claude Code needs no extension: panes without a trellis status file fall back to
 | `n` | New session |
 | `t` | New worktree tab |
 | `T` | Plain tab (tmux window in the current directory, no worktree) |
-| `R` | PR review (PR number or branch) |
+| `R` | New session, starting on the most recently used repo (for reviews) |
 | `r` | Rename session |
 | `d` | Delete session or kill tab |
 | `.` | Actions menu (change branch, launch claude, adopt) |

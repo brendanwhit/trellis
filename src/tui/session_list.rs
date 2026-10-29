@@ -292,7 +292,6 @@ enum InlineMode {
     /// (typically the confirm prompt) doesn't appear frozen during the call.
     Working { action: ConfirmAction },
     Rename { input: String, cursor: usize, is_session: bool, session_id: Option<i64>, session_name: String, window_index: Option<i64> },
-    Review { input: String, cursor: usize, repo_index: usize, repos: Vec<Repo> },
     NewTab { input: String, cursor: usize, session_id: Option<i64>, session_name: String, plain: bool },
     ActionMenu { items: Vec<(String, String)>, cursor: usize },
 }
@@ -344,9 +343,6 @@ pub struct SessionListScreen {
     snapshot: TmuxSnapshot,
     poll_job: Option<Job<TmuxSnapshot>>,
     last_poll: Instant,
-    /// gh/git network work for a PR review, plus the repo it belongs to.
-    review_job: Option<Job<Result<String, String>>>,
-    review_repo: Option<String>,
 }
 
 impl SessionListScreen {
@@ -367,8 +363,6 @@ impl SessionListScreen {
             snapshot: gather_snapshot(&HashSet::new()),
             poll_job: None,
             last_poll: Instant::now(),
-            review_job: None,
-            review_repo: None,
         };
         screen.refresh(manager);
         screen
@@ -385,51 +379,6 @@ impl SessionListScreen {
             let _ = tx.send(JobMsg::Item(gather_snapshot(&expanded_names)));
             let _ = tx.send(JobMsg::Done);
         }));
-    }
-
-    fn reviewing(&self) -> bool {
-        self.review_job.is_some()
-    }
-
-    /// Finish a PR review once the fetch lands. Runs the db/worktree half here
-    /// on the main thread, then hands back the switch that ends the app.
-    fn apply_review_results(&mut self, manager: &Manager) -> ScreenAction {
-        let Some(job) = self.review_job.as_mut() else {
-            return ScreenAction::None;
-        };
-        let resolved = job.drain().pop();
-        let finished = job.finished();
-
-        let Some(resolved) = resolved else {
-            if finished {
-                // Worker died without a result.
-                self.review_job = None;
-                self.review_repo = None;
-                self.status_message = Some("Review fetch failed.".to_string());
-            }
-            return ScreenAction::None;
-        };
-
-        self.review_job = None;
-        let repo_path = self.review_repo.take().unwrap_or_default();
-
-        let branch = match resolved {
-            Ok(b) => b,
-            Err(e) => {
-                self.status_message = Some(format!("Error: {}", e));
-                return ScreenAction::None;
-            }
-        };
-
-        match manager.checkout_and_review(&repo_path, &branch) {
-            Ok((session, _worktree_path)) => {
-                ScreenAction::Switch(SwitchAction::Session { target: session.name })
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Error: {}", e));
-                ScreenAction::None
-            }
-        }
     }
 
     /// Swap in a finished snapshot and rebuild, then re-arm the interval.
@@ -1052,40 +1001,14 @@ impl SessionListScreen {
         ScreenAction::None
     }
 
+    /// `n` with the most recently used repo highlighted, for reviewing a
+    /// remote branch or PR in it.
     fn action_review(&mut self, manager: &Manager) -> ScreenAction {
-        if self.reviewing() {
-            self.status_message = Some("A review fetch is already running.".to_string());
-            return ScreenAction::None;
+        let mut screen = super::new_session::NewSessionScreen::new(manager);
+        if let Some(path) = most_recent_repo_path(manager) {
+            screen = screen.with_highlighted_repo(&path);
         }
-        let mut repos = manager.get_repos();
-        if repos.is_empty() {
-            self.status_message = Some("No repos configured.".to_string());
-            return ScreenAction::None;
-        }
-        // Sort by most recently active session
-        let sessions = manager.get_sessions();
-        let mut repo_last_active: HashMap<i64, String> = HashMap::new();
-        for s in &sessions {
-            if let Some(ref ts) = s.last_selected_at {
-                let id = s.repo_id;
-                if !repo_last_active.contains_key(&id) || ts > repo_last_active.get(&id).unwrap() {
-                    repo_last_active.insert(id, ts.clone());
-                }
-            }
-        }
-        repos.sort_by(|a, b| {
-            let a_ts = a.id.and_then(|id| repo_last_active.get(&id));
-            let b_ts = b.id.and_then(|id| repo_last_active.get(&id));
-            b_ts.cmp(&a_ts)
-        });
-
-        self.inline_mode = InlineMode::Review {
-            input: String::new(),
-            cursor: 0,
-            repo_index: 0,
-            repos,
-        };
-        ScreenAction::None
+        ScreenAction::Push(Box::new(screen))
     }
 
     fn action_delete(&mut self, _manager: &Manager) -> ScreenAction {
@@ -1384,62 +1307,6 @@ impl SessionListScreen {
         self.refresh(manager);
     }
 
-    fn handle_review_key(&mut self, code: KeyCode, modifiers: crossterm::event::KeyModifiers, _manager: &mut Manager) -> ScreenAction {
-        match code {
-            KeyCode::Tab => {
-                if let InlineMode::Review { repo_index, repos, .. } = &mut self.inline_mode {
-                    if repos.len() > 1 {
-                        *repo_index = (*repo_index + 1) % repos.len();
-                    }
-                }
-                ScreenAction::None
-            }
-            KeyCode::Enter => {
-                let (input, repo) = match &self.inline_mode {
-                    InlineMode::Review { input, repo_index, repos, .. } => {
-                        (input.trim().to_string(), repos.get(*repo_index).cloned())
-                    }
-                    _ => return ScreenAction::None,
-                };
-                let repo = match repo {
-                    Some(r) => r,
-                    None => return ScreenAction::None,
-                };
-                if input.is_empty() {
-                    self.status_message = Some("Please enter a PR number or branch name.".to_string());
-                    return ScreenAction::None;
-                }
-                self.inline_mode = InlineMode::None;
-
-                // `gh pr view` plus `git fetch` is two network round trips; the
-                // local half runs on the main thread once this lands.
-                let repo_path = repo.path.clone();
-                self.review_repo = Some(repo_path.clone());
-                self.review_job = Some(Job::spawn(
-                    format!("Fetching {}", input),
-                    None,
-                    move |tx| {
-                        let resolved = Manager::resolve_review_branch(&repo_path, &input);
-                        let _ = tx.send(JobMsg::Item(resolved));
-                        let _ = tx.send(JobMsg::Done);
-                    },
-                ));
-                ScreenAction::None
-            }
-            KeyCode::Esc => {
-                self.inline_mode = InlineMode::None;
-                ScreenAction::None
-            }
-            _ => {
-                use super::rename::input_handle_key;
-                if let InlineMode::Review { input, cursor, .. } = &mut self.inline_mode {
-                    input_handle_key(input, cursor, code, modifiers);
-                }
-                ScreenAction::None
-            }
-        }
-    }
-
     fn handle_new_tab_key(&mut self, code: KeyCode, modifiers: crossterm::event::KeyModifiers, manager: &mut Manager) -> ScreenAction {
         match code {
             KeyCode::Enter => {
@@ -1544,6 +1411,16 @@ impl SessionListScreen {
 
 /// Rows a status message needs when wrapped to `width`, capped so a runaway
 /// message can't push the table off screen.
+/// Path of the repo whose session was selected most recently.
+fn most_recent_repo_path(manager: &Manager) -> Option<String> {
+    let latest = manager
+        .get_sessions()
+        .into_iter()
+        .filter_map(|s| s.last_selected_at.map(|ts| (ts, s.repo_id)))
+        .max()?;
+    manager.get_repos().into_iter().find(|r| r.id == Some(latest.1)).map(|r| r.path)
+}
+
 fn wrapped_height(msg: &str, width: u16) -> u16 {
     let width = width.max(1) as usize;
     (msg.chars().count().div_ceil(width) as u16).clamp(1, 6)
@@ -1551,10 +1428,6 @@ fn wrapped_height(msg: &str, width: u16) -> u16 {
 
 impl ScreenBehavior for SessionListScreen {
     fn tick(&mut self, manager: &mut Manager) -> ScreenAction {
-        let action = self.apply_review_results(manager);
-        if !matches!(action, ScreenAction::None) {
-            return action;
-        }
         self.poll_results(manager);
         // Run deferred slow work the frame after the user confirmed it. Draw
         // happens before tick in the main loop, so the "Working…" overlay is
@@ -1573,7 +1446,6 @@ impl ScreenBehavior for SessionListScreen {
         let status_height = match &self.inline_mode {
             InlineMode::None => match &self.status_message {
                 Some(msg) => wrapped_height(msg, area.width),
-                None if self.reviewing() => 1,
                 None => 0,
             },
             InlineMode::Working { .. } => 0,
@@ -1606,12 +1478,6 @@ impl ScreenBehavior for SessionListScreen {
             };
             let filter_widget = Paragraph::new(filter_text).style(filter_style);
             f.render_widget(filter_widget, chunks[1]);
-        }
-
-        // Background work indicator (PR review fetch)
-        if let Some(ref job) = self.review_job {
-            let indicator = Paragraph::new(job.indicator_line()).style(Style::default().bg(theme::BG));
-            f.render_widget(indicator, chunks[3]);
         }
 
         // Build table rows
@@ -1730,30 +1596,6 @@ impl ScreenBehavior for SessionListScreen {
                         .style(Style::default().bg(theme::CURSOR_BG));
                     f.render_widget(input_widget, input_area);
                 }
-            }
-            InlineMode::Review { ref input, cursor: cursor_pos, repo_index, ref repos } => {
-                let repo_name = repos.get(*repo_index).map(|r| r.name.as_str()).unwrap_or("?");
-                let prefix = format!("Review ({}): ", repo_name);
-                let suffix = if repos.len() > 1 { "  [tab] cycle repo  [esc] cancel" } else { "  [esc] cancel" };
-
-                let before = &input[..*cursor_pos];
-                let cursor_char_len = input[*cursor_pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
-                let cursor_display = if *cursor_pos < input.len() {
-                    input[*cursor_pos..*cursor_pos + cursor_char_len].to_string()
-                } else {
-                    " ".to_string()
-                };
-                let after = &input[(*cursor_pos + cursor_char_len).min(input.len())..];
-
-                let spans = vec![
-                    Span::styled(&prefix, Style::default().fg(theme::ACCENT)),
-                    Span::styled(before.to_string(), Style::default().fg(theme::TEXT)),
-                    Span::styled(cursor_display, Style::default().fg(theme::BG).bg(theme::ACCENT)),
-                    Span::styled(after.to_string(), Style::default().fg(theme::TEXT)),
-                    Span::styled(suffix, Style::default().fg(theme::TEXT_DIM)),
-                ];
-                let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG));
-                f.render_widget(status, chunks[3]);
             }
             InlineMode::NewTab { ref input, cursor: cursor_pos, ref session_name, plain, .. } => {
                 let prefix = if *plain {
@@ -1891,7 +1733,6 @@ impl ScreenBehavior for SessionListScreen {
             // runs the action and clears Working back to None.
             InlineMode::Working { .. } => return ScreenAction::None,
             InlineMode::Rename { .. } => return self.handle_rename_key(*code, *modifiers, manager),
-            InlineMode::Review { .. } => return self.handle_review_key(*code, *modifiers, manager),
             InlineMode::NewTab { .. } => return self.handle_new_tab_key(*code, *modifiers, manager),
             InlineMode::ActionMenu { .. } => return self.handle_action_menu_key(*code, manager),
         }
@@ -2100,5 +1941,49 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(glyphs.len(), 5);
+    }
+
+    fn manager_with_sessions(selected: &[(&str, Option<&str>)]) -> Manager {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_schema(&conn);
+        for (repo, ts) in selected {
+            let r = crate::db::add_repo(&conn, &Repo {
+                id: None,
+                path: format!("/dev/{repo}"),
+                name: repo.to_string(),
+                default_branch: "main".into(),
+            });
+            let s = crate::db::add_session(&conn, &crate::models::Session {
+                id: None,
+                name: repo.to_string(),
+                repo_id: r.id.unwrap(),
+                base_branch: "main".into(),
+                created_at: "2026-01-01T00:00:00".into(),
+                last_selected_at: None,
+                agent: None,
+            });
+            conn.execute(
+                "UPDATE sessions SET last_selected_at = ?1 WHERE id = ?2",
+                rusqlite::params![ts, s.id.unwrap()],
+            )
+            .unwrap();
+        }
+        Manager::new(conn)
+    }
+
+    #[test]
+    fn review_shortcut_targets_the_repo_with_the_latest_selected_session() {
+        let manager = manager_with_sessions(&[
+            ("old", Some("2026-01-01T00:00:00")),
+            ("recent", Some("2026-03-01T00:00:00")),
+            ("never", None),
+        ]);
+        assert_eq!(most_recent_repo_path(&manager).as_deref(), Some("/dev/recent"));
+    }
+
+    #[test]
+    fn review_shortcut_has_no_target_when_no_session_was_ever_selected() {
+        let manager = manager_with_sessions(&[("never", None)]);
+        assert_eq!(most_recent_repo_path(&manager), None);
     }
 }

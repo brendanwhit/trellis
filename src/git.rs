@@ -366,8 +366,39 @@ pub fn fast_forward_branch(repo_path: &str, branch: &str) -> Result<(), GitError
     Ok(())
 }
 
-pub fn fetch_branch(repo_path: &str, branch: &str) {
-    run(&["fetch", "origin", branch], Some(repo_path));
+pub fn fetch_branch(repo_path: &str, branch: &str) -> Result<(), GitError> {
+    let fetch = run(&["fetch", "origin", branch], Some(repo_path));
+    if !fetch.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch.stderr).trim().to_string();
+        return Err(GitError(format!("git fetch {} failed: {}", branch, stderr)));
+    }
+    Ok(())
+}
+
+fn parse_remote_branches(for_each_ref_output: &str) -> Vec<String> {
+    for_each_ref_output
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("refs/remotes/origin/"))
+        .filter(|b| *b != "HEAD")
+        .map(str::to_string)
+        .collect()
+}
+
+/// Refresh `origin` and list its branches (without the `origin/` prefix).
+pub fn fetch_remote_branches(repo_path: &str) -> Result<Vec<String>, GitError> {
+    fetch_origin(repo_path)?;
+    let output = run(
+        &["for-each-ref", "--format=%(refname)", "refs/remotes/origin"],
+        Some(repo_path),
+    );
+    if !output.status.success() {
+        return Err(GitError(format!(
+            "Failed to list remote branches in '{}': {}",
+            repo_path,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(parse_remote_branches(&String::from_utf8_lossy(&output.stdout)))
 }
 
 pub fn is_branch_merged(repo_path: &str, branch: &str, into: &str) -> Result<bool, GitError> {
@@ -409,7 +440,7 @@ pub(crate) mod tests {
     use std::fs;
     use std::process::Command;
 
-    fn init_repo(dir: &std::path::Path) {
+    pub(crate) fn init_repo(dir: &std::path::Path) {
         Command::new("git").args(["init", "-q"]).current_dir(dir).output().unwrap();
         Command::new("git").args(["config", "user.email", "t@t"]).current_dir(dir).output().unwrap();
         Command::new("git").args(["config", "user.name", "t"]).current_dir(dir).output().unwrap();
@@ -595,5 +626,30 @@ pub(crate) mod tests {
         init_repo(&repo);
         git_out(&repo, &["remote", "add", "origin", "/nonexistent/origin.git"]);
         assert!(fetch_origin(repo.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn remote_branch_parsing_strips_the_origin_prefix_and_drops_head() {
+        let out = "refs/remotes/origin/HEAD\nrefs/remotes/origin/main\nrefs/remotes/origin/feat/a\nrefs/remotes/upstream/x\n";
+        assert_eq!(parse_remote_branches(out), vec!["main".to_string(), "feat/a".to_string()]);
+    }
+
+    #[test]
+    fn fetch_remote_branches_sees_a_branch_pushed_after_the_last_fetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _) = repo_behind_origin(tmp.path());
+        let pusher = tmp.path().canonicalize().unwrap().join("pusher");
+        git_out(&pusher, &["push", "-q", "origin", "HEAD:refs/heads/feat/review"]);
+
+        let branches = fetch_remote_branches(repo.to_str().unwrap()).unwrap();
+        assert!(branches.contains(&"feat/review".to_string()));
+        assert!(!branches.iter().any(|b| b == "HEAD"));
+    }
+
+    #[test]
+    fn fetch_branch_reports_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _) = repo_behind_origin(tmp.path());
+        assert!(fetch_branch(repo.to_str().unwrap(), "does-not-exist").is_err());
     }
 }

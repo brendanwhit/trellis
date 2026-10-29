@@ -42,18 +42,55 @@ fn agent_choices(default: &str) -> Vec<String> {
     agents
 }
 
-/// The GitHub calls behind PickRepo's remote entries, swappable so tests
-/// don't hit the network.
+/// The GitHub/remote calls behind the remote entries (repos and branches),
+/// swappable so tests don't hit the network.
 #[derive(Clone, Copy)]
 struct Gh {
     list_repos: fn() -> Result<Vec<String>, GitError>,
     clone: fn(&str, &Path) -> Result<(), GitError>,
+    remote_branches: fn(&str) -> Result<Vec<String>, GitError>,
+    fetch_branch: fn(&str, &str) -> Result<(), GitError>,
+    pr_branch: fn(&str, i64) -> Result<String, GitError>,
 }
 
 const REAL_GH: Gh = Gh {
     list_repos: git::list_github_repos,
     clone: git::clone_github_repo,
+    remote_branches: git::fetch_remote_branches,
+    fetch_branch: git::fetch_branch,
+    pr_branch: git::get_pr_branch,
 };
+
+/// A remote-only branch to review, named directly or via its PR.
+enum RemotePick {
+    Branch(String),
+    Pr(i64),
+}
+
+/// Rows after the matching branches in PickBranch.
+enum ExtraRow {
+    Pr(i64),
+    NewBranch,
+}
+
+/// Remote branches that have no local branch of the same name.
+fn remote_only_branches(mut remote: Vec<String>, local: &[String]) -> Vec<String> {
+    remote.retain(|r| !local.contains(r));
+    remote.sort();
+    remote.dedup();
+    remote
+}
+
+/// Fetch the branch (resolving a PR number to its head branch first) so
+/// `origin/<branch>` exists locally.
+fn fetch_remote_pick(gh: Gh, repo_path: &str, pick: RemotePick) -> Result<String, String> {
+    let branch = match pick {
+        RemotePick::Branch(b) => b,
+        RemotePick::Pr(n) => (gh.pr_branch)(repo_path, n).map_err(|e| e.to_string())?,
+    };
+    (gh.fetch_branch)(repo_path, &branch).map_err(|e| e.to_string())?;
+    Ok(branch)
+}
 
 /// Drop remotes that a local repo's origin already covers.
 fn remote_only(remotes: Vec<String>, local_slugs: &HashSet<String>) -> Vec<String> {
@@ -135,6 +172,10 @@ pub struct NewSessionScreen {
     branches: Vec<String>,
     filtered_branches: Vec<String>,
     branch_list_state: ListState,
+    /// Entries of `branches` that exist only on `origin`.
+    remote_only_branches: HashSet<String>,
+    branch_job: Option<Job<Result<Vec<String>, String>>>,
+    pick_job: Option<Job<Result<String, String>>>,
 
     // Agent step
     agents: Vec<String>,
@@ -148,6 +189,8 @@ pub struct NewSessionScreen {
     // Selections
     selected_repo: Option<SelectedRepo>,
     selected_branch: Option<String>,
+    /// The selected branch is remote-only, so its worktree roots at `origin/<branch>`.
+    selected_remote: bool,
     selected_agent: Option<String>,
     session_name: String,
 
@@ -243,6 +286,9 @@ impl NewSessionScreen {
             branches: Vec::new(),
             filtered_branches: Vec::new(),
             branch_list_state: ListState::default(),
+            remote_only_branches: HashSet::new(),
+            branch_job: None,
+            pick_job: None,
             agents: Vec::new(),
             agent_list_state: ListState::default(),
             subsystems: Vec::new(),
@@ -250,6 +296,7 @@ impl NewSessionScreen {
             subsystem_list_state: ListState::default(),
             selected_repo: None,
             selected_branch: None,
+            selected_remote: false,
             selected_agent: None,
             session_name: String::new(),
             filter_input: String::new(),
@@ -258,12 +305,21 @@ impl NewSessionScreen {
         }
     }
 
+    /// Open with the repo at `path` highlighted, if listed.
+    pub fn with_highlighted_repo(mut self, path: &str) -> Self {
+        if let Some(i) = self.filtered_dirs.iter().position(|(_, p)| p == path) {
+            self.repo_list_state.select(Some(i));
+        }
+        self
+    }
+
     // ------------------------------------------------------------------
     // Step transitions
     // ------------------------------------------------------------------
 
     fn go_to_repo_step(&mut self) {
         self.step = Step::PickRepo;
+        self.branch_job = None;
         self.selected_repo = None;
         self.filter_input.clear();
         self.filter_cursor = 0;
@@ -279,7 +335,7 @@ impl NewSessionScreen {
     fn go_to_branch_step(&mut self) {
         self.step = Step::PickBranch;
         self.selected_branch = None;
-        let repo = self.selected_repo.as_ref().unwrap();
+        let repo = self.selected_repo.clone().unwrap();
         super::wizard_load_branches(
             &repo.path,
             &mut self.branches,
@@ -289,6 +345,14 @@ impl NewSessionScreen {
             &mut self.filter_cursor,
             &mut self.error,
         );
+        self.remote_only_branches.clear();
+        self.selected_remote = false;
+        let gh = self.gh;
+        let path = repo.path.clone();
+        self.branch_job = Some(Job::spawn("Fetching remote branches", None, move |tx| {
+            let _ = tx.send(JobMsg::Item((gh.remote_branches)(&path).map_err(|e| e.to_string())));
+            let _ = tx.send(JobMsg::Done);
+        }));
     }
 
     fn advance_after_branch(&mut self, manager: &Manager) -> ScreenAction {
@@ -361,6 +425,11 @@ impl NewSessionScreen {
     // Session creation
     // ------------------------------------------------------------------
 
+    fn start_point(&self) -> Option<String> {
+        let branch = self.selected_branch.as_ref()?;
+        self.selected_remote.then(|| format!("origin/{}", branch))
+    }
+
     fn create_session(&mut self, manager: &Manager) -> ScreenAction {
         let repo = self.selected_repo.as_ref().unwrap();
         let branch = self.selected_branch.as_ref().unwrap();
@@ -382,7 +451,7 @@ impl NewSessionScreen {
 
         let subdir_ref = subdirectory.as_deref();
 
-        match manager.create_session(&repo.path, branch, &self.session_name, subdir_ref, self.selected_agent.as_deref()) {
+        match manager.create_session(&repo.path, branch, &self.session_name, subdir_ref, self.selected_agent.as_deref(), self.start_point().as_deref()) {
             Ok((_, warning)) => {
                 let _ = tmux::switch_client(&self.session_name);
                 if let Some(w) = warning {
@@ -451,6 +520,82 @@ impl NewSessionScreen {
             Some(Err(e)) => self.error = e,
             None => self.error = "Clone failed.".to_string(),
         }
+    }
+
+    /// Add `origin`-only branches to the list, keeping the filter text and highlighted entry.
+    fn merge_remote_branches(&mut self, remote: Vec<String>) {
+        let highlighted = self
+            .branch_list_state
+            .selected()
+            .and_then(|i| self.filtered_branches.get(i))
+            .cloned();
+        let new = remote_only_branches(remote, &self.branches);
+        self.remote_only_branches.extend(new.iter().cloned());
+        self.branches.extend(new);
+        self.apply_filter();
+        if let Some(i) = highlighted.and_then(|h| self.filtered_branches.iter().position(|b| *b == h)) {
+            self.branch_list_state.select(Some(i));
+        }
+    }
+
+    fn apply_branch_job_results(&mut self) {
+        let Some(job) = self.branch_job.as_mut() else {
+            return;
+        };
+        let result = job.drain().pop();
+        if result.is_none() && !job.finished() {
+            return;
+        }
+        self.branch_job = None;
+        match result {
+            Some(Ok(remote)) if self.step == Step::PickBranch => self.merge_remote_branches(remote),
+            // Local branches still work offline; say why the remote ones are missing.
+            Some(Err(e)) if self.step == Step::PickBranch => {
+                self.error = format!("Remote branches unavailable: {}", e)
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_pick_results(&mut self, manager: &Manager) -> ScreenAction {
+        let Some(job) = self.pick_job.as_mut() else {
+            return ScreenAction::None;
+        };
+        let result = job.drain().pop();
+        if result.is_none() && !job.finished() {
+            return ScreenAction::None;
+        }
+        self.pick_job = None;
+        match result {
+            Some(Ok(branch)) => {
+                self.selected_branch = Some(branch);
+                self.selected_remote = true;
+                self.advance_after_branch(manager)
+            }
+            Some(Err(e)) => {
+                self.error = e;
+                ScreenAction::None
+            }
+            None => {
+                self.error = "Fetch failed.".to_string();
+                ScreenAction::None
+            }
+        }
+    }
+
+    fn start_remote_pick(&mut self, pick: RemotePick) -> ScreenAction {
+        let gh = self.gh;
+        let path = self.selected_repo.as_ref().unwrap().path.clone();
+        let label = match &pick {
+            RemotePick::Branch(b) => format!("Fetching {}", b),
+            RemotePick::Pr(n) => format!("Resolving PR #{}", n),
+        };
+        self.error.clear();
+        self.pick_job = Some(Job::spawn(label, None, move |tx| {
+            let _ = tx.send(JobMsg::Item(fetch_remote_pick(gh, &path, pick)));
+            let _ = tx.send(JobMsg::Done);
+        }));
+        ScreenAction::None
     }
 
     fn start_clone(&mut self, repos_dir: &Path, slug: String) {
@@ -528,7 +673,12 @@ impl NewSessionScreen {
                     .iter()
                     .filter_map(|b| crate::fuzzy::fuzzy_match_multi(&query, b).map(|s| (b.clone(), s)))
                     .collect();
-                scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+                // Remotes sort after locals on equal score.
+                scored.sort_by(|a, b| {
+                    a.1.cmp(&b.1)
+                        .then_with(|| self.remote_only_branches.contains(&a.0).cmp(&self.remote_only_branches.contains(&b.0)))
+                        .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+                });
                 self.filtered_branches = scored.into_iter().map(|(b, _)| b).collect();
                 self.branch_list_state = ListState::default();
                 if !self.filtered_branches.is_empty() {
@@ -572,20 +722,27 @@ impl NewSessionScreen {
     fn list_len(&self) -> usize {
         match self.step {
             Step::PickRepo => self.filtered_dirs.len() + 1, // +1 for "add repo"
-            Step::PickBranch => {
-                let extra = if !self.filter_input.is_empty()
-                    && !self.filtered_branches.contains(&self.filter_input)
-                {
-                    1
-                } else {
-                    0
-                };
-                self.filtered_branches.len() + extra
-            }
+            Step::PickBranch => self.filtered_branches.len() + self.extra_rows().len(),
             Step::PickCloneDir => self.filtered_clone_dirs.len(),
             Step::PickAgent => self.agents.len(),
             Step::PickSubsystem => self.filtered_subsystems.len() + 1, // +1 for root
         }
+    }
+
+    /// A digits-only query offers its PR unless a branch has exactly that name.
+    fn extra_rows(&self) -> Vec<ExtraRow> {
+        let query = &self.filter_input;
+        let mut rows = Vec::new();
+        if query.is_empty() || self.filtered_branches.contains(query) {
+            return rows;
+        }
+        if let Ok(n) = query.parse::<i64>() {
+            if query.chars().all(|c| c.is_ascii_digit()) {
+                rows.push(ExtraRow::Pr(n));
+            }
+        }
+        rows.push(ExtraRow::NewBranch);
+        rows
     }
 
     fn selected_index(&self) -> Option<usize> {
@@ -694,14 +851,18 @@ impl NewSessionScreen {
 
     fn confirm_branch(&mut self, manager: &Manager) -> ScreenAction {
         let idx = self.branch_list_state.selected().unwrap_or(0);
-        if idx < self.filtered_branches.len() {
-            self.selected_branch = Some(self.filtered_branches[idx].clone());
-        } else {
-            // "New branch" item — use the typed text
-            if self.filter_input.is_empty() {
-                return ScreenAction::None;
+        if let Some(name) = self.filtered_branches.get(idx).cloned() {
+            if self.remote_only_branches.contains(&name) {
+                return self.start_remote_pick(RemotePick::Branch(name));
             }
-            self.selected_branch = Some(self.filter_input.clone());
+            self.selected_branch = Some(name);
+        } else {
+            match self.extra_rows().get(idx - self.filtered_branches.len()) {
+                Some(ExtraRow::Pr(n)) => return self.start_remote_pick(RemotePick::Pr(*n)),
+                // Typed text names a new branch off the default branch.
+                Some(ExtraRow::NewBranch) => self.selected_branch = Some(self.filter_input.clone()),
+                None => return ScreenAction::None,
+            }
         }
         self.advance_after_branch(manager)
     }
@@ -749,7 +910,7 @@ impl NewSessionScreen {
         }
         match self.step {
             Step::PickRepo => "Type to filter. Enter to select. Escape to cancel.",
-            Step::PickBranch => "Type to filter or enter a new branch name. Enter to confirm.",
+            Step::PickBranch => "Type to filter, a new branch name, or a PR number. Enter to confirm.",
             Step::PickCloneDir => "Pick the directory to clone into. Enter to confirm. Escape to go back.",
             Step::PickAgent => "Pick the agent to launch. Enter to confirm. Escape to go back.",
             Step::PickSubsystem => "Pick a subsystem to start in, or select root. Enter to confirm.",
@@ -762,7 +923,7 @@ impl NewSessionScreen {
         }
         match self.step {
             Step::PickRepo => "Filter repos...",
-            Step::PickBranch => "Filter or type a new branch...",
+            Step::PickBranch => "Filter, new branch, or PR number...",
             Step::PickCloneDir => "Filter directories...",
             Step::PickAgent => "",
             Step::PickSubsystem => "Filter...",
@@ -794,20 +955,23 @@ impl NewSessionScreen {
                 let mut items: Vec<ListItem> = self
                     .filtered_branches
                     .iter()
-                    .map(|b| ListItem::new(Span::styled(b.as_str(), Style::default().fg(theme::TEXT))))
+                    .map(|b| {
+                        let mut spans = vec![Span::styled(b.as_str(), Style::default().fg(theme::TEXT))];
+                        if self.remote_only_branches.contains(b) {
+                            spans.push(Span::styled(" (remote)", Style::default().fg(theme::TEXT_DIM)));
+                        }
+                        ListItem::new(Line::from(spans))
+                    })
                     .collect();
-                // Show "+ New branch: <typed>" when filter text doesn't match existing
-                if !self.filter_input.is_empty()
-                    && !self.filtered_branches.contains(&self.filter_input)
-                {
-                    let line = Line::from(vec![
-                        Span::styled("+ New branch: ", Style::default().fg(theme::GREEN)),
-                        Span::styled(
-                            self.filter_input.as_str(),
-                            Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
-                        ),
-                    ]);
-                    items.push(ListItem::new(line));
+                for row in self.extra_rows() {
+                    let (label, typed) = match row {
+                        ExtraRow::Pr(n) => ("+ PR ".to_string(), format!("#{}", n)),
+                        ExtraRow::NewBranch => ("+ New branch: ".to_string(), self.filter_input.clone()),
+                    };
+                    items.push(ListItem::new(Line::from(vec![
+                        Span::styled(label, Style::default().fg(theme::GREEN)),
+                        Span::styled(typed, Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+                    ])));
                 }
                 items
             }
@@ -917,20 +1081,23 @@ impl ScreenBehavior for NewSessionScreen {
             .clone_job
             .as_ref()
             .map(|j| j.indicator_line())
+            .or_else(|| self.pick_job.as_ref().map(|j| j.indicator_line()))
             .or_else(|| self.fetch_job.as_ref().map(|j| j.indicator_line()))
+            .or_else(|| self.branch_job.as_ref().map(|j| j.indicator_line()))
         {
             f.render_widget(Paragraph::new(line).alignment(Alignment::Center), chunks[5]);
         }
     }
 
-    fn tick(&mut self, _manager: &mut Manager) -> ScreenAction {
+    fn tick(&mut self, manager: &mut Manager) -> ScreenAction {
         self.apply_fetch_results();
         self.apply_clone_results();
-        ScreenAction::None
+        self.apply_branch_job_results();
+        self.apply_pick_results(manager)
     }
 
     fn handle_event(&mut self, event: &Event, manager: &mut Manager) -> ScreenAction {
-        if self.clone_job.is_some() {
+        if self.clone_job.is_some() || self.pick_job.is_some() {
             return ScreenAction::None;
         }
         if let Event::Key(KeyEvent { code, kind: KeyEventKind::Press, modifiers, .. }) = event {
@@ -1097,6 +1264,9 @@ mod tests {
             clone: |_, dest| {
                 std::fs::create_dir_all(dest.join(".git")).map_err(|e| GitError(e.to_string()))
             },
+            remote_branches: |_| Ok(Vec::new()),
+            fetch_branch: |_, _| Ok(()),
+            pr_branch: |_, n| Ok(format!("pr-{n}")),
         }
     }
 
@@ -1189,6 +1359,7 @@ mod tests {
         let gh = Gh {
             list_repos: || Err(GitError("not logged in".into())),
             clone: |_, _| Err(GitError("boom".into())),
+            ..gh_ok_listing()
         };
         let (mut screen, mut manager, _tmp) = screen_with(gh);
         settle(&mut screen, &mut manager, |s| s.fetch_job.is_none());
@@ -1201,6 +1372,208 @@ mod tests {
         settle(&mut screen, &mut manager, |s| s.clone_job.is_none());
         assert_eq!(screen.step, Step::PickRepo);
         assert!(screen.error.contains("boom"));
+    }
+
+    static FETCHED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// `main` and `local-one` are also local; only `feat/their-work` is remote-only.
+    fn gh_with_remote_branches() -> Gh {
+        Gh {
+            remote_branches: |_| {
+                Ok(["main", "local-one", "feat/their-work"].iter().map(|b| b.to_string()).collect())
+            },
+            fetch_branch: |_, b| {
+                FETCHED.lock().unwrap().push(b.to_string());
+                Ok(())
+            },
+            pr_branch: |_, n| Ok(format!("pr-{n}-head")),
+            ..gh_ok_listing()
+        }
+    }
+
+    fn type_str(screen: &mut NewSessionScreen, manager: &mut Manager, text: &str) {
+        for c in text.chars() {
+            let ev = Event::Key(KeyEvent::new(KeyCode::Char(c), crossterm::event::KeyModifiers::NONE));
+            screen.handle_event(&ev, manager);
+        }
+    }
+
+    /// A wizard on PickBranch for a real repo `proj` with local branches `main` and `local-one`.
+    fn branch_screen(gh: Gh) -> (NewSessionScreen, Manager, tempfile::TempDir) {
+        let (_, mut manager, tmp) = screen_with(gh);
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::git::tests::init_repo(&repo);
+        crate::git::tests::git_out(&repo, &["branch", "local-one"]);
+        let mut screen = NewSessionScreen::new_with(&manager, gh);
+        settle(&mut screen, &mut manager, |s| s.fetch_job.is_none());
+        let proj = screen.filtered_dirs.iter().position(|(_, p)| p.ends_with("proj")).unwrap();
+        screen.repo_list_state.select(Some(proj));
+        press_enter(&mut screen, &mut manager);
+        assert_eq!(screen.step, Step::PickBranch);
+        (screen, manager, tmp)
+    }
+
+    #[test]
+    fn remote_only_branches_exclude_local_names_and_duplicates() {
+        let local = vec!["main".to_string(), "dev".to_string()];
+        let remote = ["main", "feat/a", "dev", "feat/a", "feat/b"].iter().map(|b| b.to_string()).collect();
+        let only = remote_only_branches(remote, &local);
+        assert!(only.iter().all(|b| !local.contains(b)));
+        let unique: HashSet<&String> = only.iter().collect();
+        assert_eq!(unique.len(), only.len());
+        assert!(only.contains(&"feat/a".to_string()) && only.contains(&"feat/b".to_string()));
+    }
+
+    #[test]
+    fn branch_list_shows_locals_at_once_then_merges_tagged_remote_only_branches() {
+        let (mut screen, mut manager, _tmp) = branch_screen(gh_with_remote_branches());
+        assert!(screen.remote_only_branches.is_empty(), "locals show before the fetch lands");
+        let locals = screen.branches.clone();
+        assert!(locals.contains(&"local-one".to_string()));
+
+        settle(&mut screen, &mut manager, |s| s.branch_job.is_none());
+        assert!(screen.branches.contains(&"feat/their-work".to_string()));
+        for b in &screen.branches {
+            assert_ne!(
+                screen.remote_only_branches.contains(b),
+                locals.contains(b),
+                "{b} must be exactly one of local / remote-only"
+            );
+        }
+        let unique: HashSet<&String> = screen.branches.iter().collect();
+        assert_eq!(unique.len(), screen.branches.len());
+    }
+
+    #[test]
+    fn pr_row_is_offered_only_for_all_digit_queries_without_an_exact_branch() {
+        let (mut screen, _manager, _tmp) = branch_screen(gh_with_remote_branches());
+        let has_pr = |s: &NewSessionScreen| s.extra_rows().iter().any(|r| matches!(r, ExtraRow::Pr(_)));
+        for (query, expected) in [("123", true), ("12a", false), ("feat", false), ("-1", false), ("", false)] {
+            screen.filter_input = query.to_string();
+            screen.apply_filter();
+            assert_eq!(has_pr(&screen), expected, "query {query:?}");
+        }
+        screen.branches.push("123".to_string());
+        screen.filter_input = "123".to_string();
+        screen.apply_filter();
+        assert!(!has_pr(&screen), "a branch literally named 123 wins");
+    }
+
+    #[test]
+    fn picking_a_remote_only_branch_fetches_it_and_roots_the_worktree_at_origin() {
+        let (mut screen, mut manager, _tmp) = branch_screen(gh_with_remote_branches());
+        settle(&mut screen, &mut manager, |s| s.branch_job.is_none());
+        type_str(&mut screen, &mut manager, "their-work");
+        press_enter(&mut screen, &mut manager);
+        assert!(screen.pick_job.is_some(), "remote pick must fetch before advancing");
+        assert_eq!(screen.step, Step::PickBranch);
+
+        settle(&mut screen, &mut manager, |s| s.pick_job.is_none());
+        assert_eq!(screen.step, Step::PickAgent);
+        assert_eq!(screen.selected_branch.as_deref(), Some("feat/their-work"));
+        assert_eq!(screen.start_point().as_deref(), Some("origin/feat/their-work"));
+        assert!(FETCHED.lock().unwrap().contains(&"feat/their-work".to_string()));
+    }
+
+    #[test]
+    fn picking_a_pr_row_resolves_its_head_branch_then_behaves_like_a_remote_pick() {
+        let (mut screen, mut manager, _tmp) = branch_screen(gh_with_remote_branches());
+        settle(&mut screen, &mut manager, |s| s.branch_job.is_none());
+        type_str(&mut screen, &mut manager, "4242");
+        press_enter(&mut screen, &mut manager);
+        settle(&mut screen, &mut manager, |s| s.pick_job.is_none());
+
+        assert_eq!(screen.step, Step::PickAgent);
+        assert_eq!(screen.selected_branch.as_deref(), Some("pr-4242-head"));
+        assert_eq!(screen.start_point().as_deref(), Some("origin/pr-4242-head"));
+        assert!(FETCHED.lock().unwrap().contains(&"pr-4242-head".to_string()));
+    }
+
+    #[test]
+    fn local_and_typed_new_branches_keep_the_default_branch_start_point() {
+        let (mut screen, mut manager, _tmp) = branch_screen(gh_with_remote_branches());
+        settle(&mut screen, &mut manager, |s| s.branch_job.is_none());
+        type_str(&mut screen, &mut manager, "local-one");
+        press_enter(&mut screen, &mut manager);
+        assert_eq!(screen.step, Step::PickAgent);
+        assert_eq!(screen.selected_branch.as_deref(), Some("local-one"));
+        assert_eq!(screen.start_point(), None);
+
+        screen.go_to_branch_step();
+        settle(&mut screen, &mut manager, |s| s.branch_job.is_none());
+        type_str(&mut screen, &mut manager, "brand-new");
+        press_enter(&mut screen, &mut manager);
+        assert!(screen.pick_job.is_none(), "a new branch needs no fetch");
+        assert_eq!(screen.step, Step::PickAgent);
+        assert_eq!(screen.selected_branch.as_deref(), Some("brand-new"));
+        assert_eq!(screen.start_point(), None);
+    }
+
+    #[test]
+    fn failed_fetch_or_pr_lookup_stays_on_pick_branch_with_the_error() {
+        let gh = Gh {
+            fetch_branch: |_, _| Err(GitError("fetch boom".into())),
+            ..gh_with_remote_branches()
+        };
+        let (mut screen, mut manager, _tmp) = branch_screen(gh);
+        settle(&mut screen, &mut manager, |s| s.branch_job.is_none());
+        type_str(&mut screen, &mut manager, "their-work");
+        press_enter(&mut screen, &mut manager);
+        settle(&mut screen, &mut manager, |s| s.pick_job.is_none());
+        assert_eq!(screen.step, Step::PickBranch);
+        assert!(screen.error.contains("fetch boom"));
+        assert_eq!(screen.selected_branch, None);
+
+        let gh = Gh {
+            pr_branch: |_, _| Err(GitError("no such PR".into())),
+            ..gh_with_remote_branches()
+        };
+        let (mut screen, mut manager, _tmp) = branch_screen(gh);
+        settle(&mut screen, &mut manager, |s| s.branch_job.is_none());
+        type_str(&mut screen, &mut manager, "7");
+        press_enter(&mut screen, &mut manager);
+        settle(&mut screen, &mut manager, |s| s.pick_job.is_none());
+        assert_eq!(screen.step, Step::PickBranch);
+        assert!(screen.error.contains("no such PR"));
+        assert_eq!(screen.selected_branch, None);
+    }
+
+    #[test]
+    fn failed_remote_branch_refresh_keeps_the_local_list_with_a_notice() {
+        let gh = Gh {
+            remote_branches: |_| Err(GitError("offline".into())),
+            ..gh_with_remote_branches()
+        };
+        let (mut screen, mut manager, _tmp) = branch_screen(gh);
+        settle(&mut screen, &mut manager, |s| s.branch_job.is_none());
+        assert!(screen.error.contains("offline"));
+        assert!(screen.remote_only_branches.is_empty());
+        assert!(screen.branches.contains(&"local-one".to_string()));
+    }
+
+    #[test]
+    fn highlighting_a_repo_selects_it_without_filtering_the_list() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_schema(&conn);
+        let manager = Manager::new(conn);
+        manager.set_config("repos_dir", &format!("{}\n{}", a.path().display(), b.path().display()));
+        for (dir, name) in [(&a, "alpha"), (&b, "zulu")] {
+            let repo = dir.path().join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            crate::git::tests::init_repo(&repo);
+        }
+        let screen = NewSessionScreen::new_with(&manager, gh_ok_listing());
+        let zulu = screen.filtered_dirs.iter().position(|(n, _)| n == "zulu").unwrap();
+        let zulu_path = screen.filtered_dirs[zulu].1.clone();
+        let total = screen.filtered_dirs.len();
+        assert_ne!(zulu, 0);
+
+        let screen = screen.with_highlighted_repo(&zulu_path);
+        assert_eq!(screen.step, Step::PickRepo);
+        assert_eq!(screen.repo_list_state.selected(), Some(zulu));
+        assert_eq!(screen.filtered_dirs.len(), total);
     }
 
     #[test]

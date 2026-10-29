@@ -31,7 +31,12 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(vec![
             Span::raw("  "),
             Span::styled("n", Style::default().fg(theme::ACCENT)),
-            Span::styled("         New\u{2026} (session, tab, or PR review)", Style::default().fg(theme::TEXT)),
+            Span::styled("         New session (branch, remote branch, or PR #)", Style::default().fg(theme::TEXT)),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("R", Style::default().fg(theme::ACCENT)),
+            Span::styled("         New session in last-used repo (for review)", Style::default().fg(theme::TEXT)),
         ]),
         Line::from(vec![
             Span::raw("  "),
