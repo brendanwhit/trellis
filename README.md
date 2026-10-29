@@ -84,6 +84,19 @@ Claude Code needs no extension: panes without a trellis status file fall back to
 | `?` | Help |
 | `q` | Quit |
 
+## Pings
+
+`trellis notify` is a Claude Code hook that plays a sound and shows a macOS notification naming the session when an agent needs input. Add it for both events in `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "Notification": [{ "hooks": [{ "type": "command", "command": "trellis notify" }] }],
+  "Stop": [{ "hooks": [{ "type": "command", "command": "trellis notify" }] }]
+}
+```
+
+`Notification` covers permission and question dialogs; `Stop` catches replies that end in a plain-text question. Sessions you're attached to don't ping. Turn it off with the `notify` setting (`off`) in Settings (`S`).
+
 ## Data
 
 Session and worktree metadata lives in `~/.local/share/trellis/trellis.db` (SQLite); agent status files live beside it in `panes/`. Worktrees are created at `<worktrees_dir>/<repo-name>/<branch-name>` (default `~/dev/worktrees/`). Both directories are configurable in settings.

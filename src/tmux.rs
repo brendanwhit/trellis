@@ -140,6 +140,28 @@ pub fn session_active_pane_path(session: &str) -> Option<String> {
     if path.is_empty() { None } else { Some(path) }
 }
 
+/// Where a pane lives and who could be looking at it.
+pub struct PaneView {
+    pub session: String,
+    /// Active pane of its window's active window, i.e. on screen for an attached client.
+    pub visible: bool,
+    pub client_pids: Vec<u32>,
+}
+
+pub fn pane_view(pane_id: &str) -> Option<PaneView> {
+    let output = run(&["display-message", "-p", "-t", pane_id, "#{session_name}\t#{window_active}\t#{pane_active}"]);
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.trim_end().split('\t');
+    let session = parts.next()?.to_string();
+    let visible = parts.next()? == "1" && parts.next()? == "1";
+    let clients = run(&["list-clients", "-t", &session, "-F", "#{client_pid}"]);
+    let client_pids = String::from_utf8_lossy(&clients.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect();
+    Some(PaneView { session, visible, client_pids })
+}
+
 /// Return the name of the session the calling client is currently attached
 /// to (i.e. the parent session when running inside `display-popup`).
 pub fn attached_session() -> Option<String> {
