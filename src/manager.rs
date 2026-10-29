@@ -96,7 +96,7 @@ pub fn apply_layout(session_name: &str, working_dir: &str, agent_cmd: &str) -> R
 ///
 /// `start_point` is only consulted when creating a NEW local branch. Callers
 /// pass what they want the branch rooted at (e.g. `repo.default_branch`,
-/// `session.base_branch`, or `format!("origin/{}", branch)` for PR review).
+/// `session.base_branch`, or `origin/<branch>` for a remote-only branch).
 pub fn resolve_or_create_worktree(
     repo_path: &str,
     repo_name: &str,
@@ -318,64 +318,6 @@ impl Manager {
         Ok(())
     }
 
-    fn find_or_create_session(&self, repo: &Repo, branch: &str, wt_path: &str) -> Result<Session, String> {
-        let session_name = tmux::sanitize_session_name(branch);
-
-        // Existing DB row?
-        if let Some(existing) = self.get_session_by_name(&session_name) {
-            if tmux::session_exists(&session_name) {
-                if existing.repo_id == repo.id.unwrap() {
-                    return Ok(existing);
-                }
-                return Err(format!("Session '{}' is live for another repo", session_name));
-            }
-            // Dead row — drop it.
-            if let Some(id) = existing.id {
-                self.delete_session(id, false)?;
-            }
-        }
-
-        // tmux first — fail loudly before touching the DB.
-        apply_layout(&session_name, wt_path, &self.agent_cmd())
-            .map_err(|e| format!("Failed to create tmux session: {}", e))?;
-
-        let session = db::add_session(
-            &self.conn,
-            &Session {
-                id: None,
-                name: session_name.clone(),
-                repo_id: repo.id.unwrap(),
-                base_branch: branch.to_string(),
-                created_at: utc_now(),
-                last_selected_at: None,
-                agent: None,
-            },
-        );
-
-        // A worktree row left behind by a deleted session has session_id NULL;
-        // re-link it rather than inserting a duplicate.
-        if let Some(wt) = db::get_worktree_by_path(&self.conn, wt_path) {
-            if wt.session_id.is_none() {
-                db::link_worktree_to_session(&self.conn, wt.id.unwrap(), session.id.unwrap());
-            }
-        } else if wt_path != repo.path {
-            db::add_worktree(
-                &self.conn,
-                &Worktree {
-                    id: None,
-                    repo_id: repo.id.unwrap(),
-                    path: wt_path.to_string(),
-                    branch: branch.to_string(),
-                    session_id: session.id,
-                    tmux_window: None,
-                    created_at: utc_now(),
-                },
-            );
-        }
-
-        Ok(session)
-    }
-
     // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
@@ -426,6 +368,8 @@ impl Manager {
     /// Register repo if needed, create or reuse worktree, create or reuse DB
     /// session, create tmux session. If a live session for (repo, base_branch)
     /// already exists, routes to it (user-typed `session_name` ignored).
+    /// `start_point` roots a not-yet-existing local branch (e.g. `origin/<branch>`
+    /// for a remote-only one); `None` roots it at the freshly fetched default branch.
     pub fn create_session(
         &self,
         repo_path: &str,
@@ -433,6 +377,7 @@ impl Manager {
         session_name: &str,
         subdirectory: Option<&str>,
         agent: Option<&str>,
+        start_point: Option<&str>,
     ) -> Result<(Session, Option<String>), String> {
         let repo = self.get_or_create_repo(repo_path);
 
@@ -455,11 +400,13 @@ impl Manager {
         }
 
         // No live session for this branch. Resolve the worktree.
-        let (start_point, warning) = refresh_default_branch(repo_path, &repo.default_branch);
+        let (start_point, warning) = match start_point {
+            Some(sp) => (sp.to_string(), None),
+            None => refresh_default_branch(repo_path, &repo.default_branch),
+        };
         let wt_path = if base_branch == repo.default_branch {
             repo.path.clone()
         } else {
-            // New branches root at the freshly fetched default branch.
             self.find_or_create_worktree(&repo, base_branch, &start_point)?
         };
 
@@ -578,39 +525,6 @@ impl Manager {
             base_branch: base_branch.to_string(),
             ..session
         })
-    }
-
-    /// Create or reuse worktree + session for a PR number or branch, ready
-    /// for review. Returns (session, worktree_path).
-    /// The network half of a PR review: resolve a PR number to its branch via
-    /// `gh`, then fetch it. Two round trips, so callers run this on a worker —
-    /// it needs no connection, only paths.
-    pub fn resolve_review_branch(repo_path: &str, pr_or_branch: &str) -> Result<String, String> {
-        let branch = if pr_or_branch.chars().all(|c| c.is_ascii_digit()) && !pr_or_branch.is_empty() {
-            let pr_num: i64 = pr_or_branch.parse().unwrap();
-            git::get_pr_branch(repo_path, pr_num).map_err(|e| format!("Failed to get PR branch: {}", e))?
-        } else {
-            pr_or_branch.to_string()
-        };
-
-        git::fetch_branch(repo_path, &branch);
-        Ok(branch)
-    }
-
-    /// The local half, once the branch is fetched: worktree, session and db rows.
-    pub fn checkout_and_review(
-        &self,
-        repo_path: &str,
-        branch: &str,
-    ) -> Result<(Session, String), String> {
-        let repo = self.get_or_create_repo(repo_path);
-
-        // PR review roots the new local branch at the PR's HEAD on the remote,
-        // not main — preserves the original `checkout_and_review` semantic.
-        let start_point = format!("origin/{}", branch);
-        let wt_path = self.find_or_create_worktree(&repo, branch, &start_point)?;
-        let session = self.find_or_create_session(&repo, branch, &wt_path)?;
-        Ok((session, wt_path))
     }
 
     /// Insert the session and worktree rows for a freshly-adopted worktree.
@@ -1371,45 +1285,6 @@ mod reuse_tests {
     }
 
     #[test]
-    fn review_input_that_is_not_a_pr_number_is_used_as_the_branch_verbatim() {
-        let tmp = tempdir().unwrap();
-        let (repo_path, _) = make_repo(tmp.path());
-
-        // Non-numeric input must not be sent to `gh`; it is already a branch.
-        // The fetch that follows is best-effort and fails silently with no remote.
-        let branch = Manager::resolve_review_branch(&repo_path, "feat/some-branch").unwrap();
-
-        assert_eq!(branch, "feat/some-branch");
-    }
-
-    #[test]
-    fn review_input_with_a_slash_is_never_treated_as_a_pr_number() {
-        let tmp = tempdir().unwrap();
-        let (repo_path, _) = make_repo(tmp.path());
-
-        // Guards the digit test against matching things like "123/foo".
-        let branch = Manager::resolve_review_branch(&repo_path, "123/foo").unwrap();
-
-        assert_eq!(branch, "123/foo");
-    }
-
-    #[test]
-    fn find_or_create_session_inserts_when_missing() {
-        let tmp = tempdir().unwrap();
-        let (repo_path, _) = make_repo(tmp.path());
-        let mgr = make_manager();
-
-        let repo = mgr.get_or_create_repo(&repo_path);
-        let branch = unique_branch("fresh");
-        let _guard = SessionGuard(crate::tmux::sanitize_session_name(&branch));
-        let wt_path = tmp.path().join("wt").to_string_lossy().to_string();
-
-        let session = mgr.find_or_create_session(&repo, &branch, &wt_path).unwrap();
-        assert_eq!(session.base_branch, branch);
-        assert!(crate::db::get_session_by_name(&mgr.conn, &session.name).is_some());
-    }
-
-    #[test]
     fn repos_dirs_parses_multiline_config() {
         let mgr = make_manager();
         crate::db::set_config(&mgr.conn, "repos_dir", "/Users/x/personal\n/Users/x/work");
@@ -1614,41 +1489,6 @@ mod reuse_tests {
     }
 
     #[test]
-    fn find_or_create_session_drops_stale_db_row_then_inserts() {
-        let tmp = tempdir().unwrap();
-        let (repo_path, _) = make_repo(tmp.path());
-        let mgr = make_manager();
-
-        let repo = mgr.get_or_create_repo(&repo_path);
-        let branch = unique_branch("stale");
-        let session_name = crate::tmux::sanitize_session_name(&branch);
-        let _guard = SessionGuard(session_name.clone());
-
-        // Pre-insert a "stale" DB row. The corresponding tmux session does not
-        // exist yet (unique name + Drop cleanup guarantees this across runs).
-        crate::db::add_session(&mgr.conn, &crate::models::Session {
-            id: None,
-            name: session_name.clone(),
-            repo_id: repo.id.unwrap(),
-            base_branch: branch.clone(),
-            created_at: crate::utils::utc_now(),
-            last_selected_at: None,
-            agent: None,
-        });
-        assert!(crate::db::get_session_by_name(&mgr.conn, &session_name).is_some());
-        assert!(!crate::tmux::session_exists(&session_name));
-
-        let wt_path = tmp.path().join("wt").to_string_lossy().to_string();
-        let fresh = mgr.find_or_create_session(&repo, &branch, &wt_path).unwrap();
-        assert_eq!(fresh.name, session_name);
-        let rows: Vec<_> = crate::db::get_sessions(&mgr.conn)
-            .into_iter()
-            .filter(|s| s.name == session_name)
-            .collect();
-        assert_eq!(rows.len(), 1);
-    }
-
-    #[test]
     fn scan_repos_registers_repo_nested_in_container_dir() {
         let mgr = make_manager();
         let tmp = tempfile::tempdir().unwrap();
@@ -1737,7 +1577,7 @@ mod reuse_tests {
         let name = unique_branch("agent-create");
         let _guard = SessionGuard(crate::tmux::sanitize_session_name(&name));
 
-        let (session, _) = mgr.create_session(&repo_path, "main", &name, None, Some("pi")).unwrap();
+        let (session, _) = mgr.create_session(&repo_path, "main", &name, None, Some("pi"), None).unwrap();
         assert_eq!(session.agent.as_deref(), Some("pi"));
         assert_eq!(mgr.agent_for_name(&session.name), "pi");
     }
@@ -1758,7 +1598,7 @@ mod reuse_tests {
         let _guard = SessionGuard(crate::tmux::sanitize_session_name(&branch));
 
         let (_, warning) = mgr
-            .create_session(repo.to_str().unwrap(), &branch, "", None, None)
+            .create_session(repo.to_str().unwrap(), &branch, "", None, None, None)
             .unwrap();
 
         assert_eq!(warning, None);
@@ -1816,12 +1656,46 @@ mod reuse_tests {
         let _guard = SessionGuard(crate::tmux::sanitize_session_name(&branch));
 
         let (_, warning) = mgr
-            .create_session(repo.to_str().unwrap(), &branch, "", None, None)
+            .create_session(repo.to_str().unwrap(), &branch, "", None, None, None)
             .unwrap();
 
         assert!(warning.is_some());
         let wt = wts.join("repo").join(branch.replace('/', "-"));
         assert_eq!(git_out(&wt, &["rev-parse", "HEAD"]), tip);
         assert_eq!(git_out(&repo, &["rev-parse", "main"]), main_before);
+    }
+
+    #[test]
+    fn create_session_with_a_start_point_roots_the_worktree_there_not_at_the_default_branch() {
+        use crate::git::tests::{git_out, repo_behind_origin};
+        let tmp = tempdir().unwrap();
+        let (repo, main_tip) = repo_behind_origin(tmp.path());
+        let pusher = tmp.path().canonicalize().unwrap().join("pusher");
+        let remote_branch = unique_branch("remote-only");
+        git_out(&pusher, &["commit", "--allow-empty", "-qm", "their work"]);
+        let review_tip = git_out(&pusher, &["rev-parse", "HEAD"]);
+        git_out(&pusher, &["push", "-q", "origin", &format!("HEAD:refs/heads/{remote_branch}")]);
+        crate::git::fetch_branch(repo.to_str().unwrap(), &remote_branch).unwrap();
+        let wts = tmp.path().canonicalize().unwrap().join("wts");
+
+        let mgr = make_manager();
+        crate::db::set_config(&mgr.conn, "worktrees_dir", wts.to_str().unwrap());
+        let _guard = SessionGuard(crate::tmux::sanitize_session_name(&remote_branch));
+
+        let (_, warning) = mgr
+            .create_session(
+                repo.to_str().unwrap(),
+                &remote_branch,
+                "",
+                None,
+                None,
+                Some(&format!("origin/{remote_branch}")),
+            )
+            .unwrap();
+
+        assert_eq!(warning, None);
+        let wt = wts.join("repo").join(remote_branch.replace('/', "-"));
+        assert_eq!(git_out(&wt, &["rev-parse", "HEAD"]), review_tip);
+        assert_ne!(review_tip, main_tip);
     }
 }
