@@ -42,6 +42,8 @@ Any agent can participate by writing `~/.local/share/trellis/panes/<TMUX_PANE>.j
 
 `state` is `idle`, `working`, or `prompting`; `title` is optional and becomes the window name. Trellis ignores a file whose `pid` is no longer running.
 
+Claude Code needs no extension: panes without a trellis status file fall back to Claude's own `~/.claude/sessions/<pid>.json` (or `$CLAUDE_CONFIG_DIR/sessions`), matched by the pane in its `tmux` field. `busy` / `waiting` / `idle` map to `working` / `prompting` / `idle`. That schema is undocumented, so unknown values are ignored; Claude panes get no auto-rename title.
+
 ## What it does
 
 **Session list** is the main view. Shows all tmux sessions sorted with the current session on top. `enter` to switch, `tab` to expand and see live windows with running commands. Agent panes show up with a `✦` marker and a status (`working…`, `needs input`, `idle`). `/` to filter.
