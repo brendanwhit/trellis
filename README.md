@@ -52,7 +52,7 @@ Claude Code needs no extension: panes without a trellis status file fall back to
 
 **New tab** (`t`) creates a worktree branching from the session's branch and launches the agent in it.
 
-**Reviewing a branch or PR**: in the New session wizard (`n`, or `R` to start on your most recently used repo) the branch list includes remote-only branches (tagged `(remote)`); type a PR number to review that PR. Trellis fetches the branch, creates a worktree at `origin/<branch>`, launches the agent, and switches to it.
+**Reviewing a branch or PR**: in the New session wizard (`n`, or `R` to start on your most recently used repo) the branch list includes remote-only branches (tagged `(remote)`); type a PR number to review that PR. Trellis fetches the branch, creates a worktree at `origin/<branch>`, sets the branch to track its remote (fast-forwarding a stale local copy; if the local copy has commits origin lacks you are asked whether to reset it, otherwise it is kept), launches the agent, and switches to it.
 
 **History** (`H`) opens the agent's own resume picker (`<agent> -r`) in a new window of the selected live session, scoped to that session's directory.
 

@@ -20,6 +20,14 @@ const SHELL_WINDOW: &str = "shell";
 /// Agent launched when `agent_cmd` is unset.
 pub const DEFAULT_AGENT_CMD: &str = "claude";
 
+/// The session's branch is a remote branch to review: root and sync it to
+/// `origin/<branch>` (which the caller has just fetched) and track it.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteStart {
+    /// Reset a diverged local branch to origin (the user confirmed losing its local-only commits).
+    pub reset: bool,
+}
+
 /// A worktree git knows about that Trellis hasn't registered yet.
 #[derive(Debug, Clone)]
 pub struct OrphanWorktree {
@@ -368,8 +376,9 @@ impl Manager {
     /// Register repo if needed, create or reuse worktree, create or reuse DB
     /// session, create tmux session. If a live session for (repo, base_branch)
     /// already exists, routes to it (user-typed `session_name` ignored).
-    /// `start_point` roots a not-yet-existing local branch (e.g. `origin/<branch>`
-    /// for a remote-only one); `None` roots it at the freshly fetched default branch.
+    /// `remote` marks `base_branch` as a fetched remote branch: a new local branch
+    /// roots at `origin/<branch>` instead of the default branch, an existing one is
+    /// synced to it (see `git::sync_with_origin`), and upstream is set to it.
     pub fn create_session(
         &self,
         repo_path: &str,
@@ -377,7 +386,7 @@ impl Manager {
         session_name: &str,
         subdirectory: Option<&str>,
         agent: Option<&str>,
-        start_point: Option<&str>,
+        remote: Option<RemoteStart>,
     ) -> Result<(Session, Option<String>), String> {
         let repo = self.get_or_create_repo(repo_path);
 
@@ -400,8 +409,12 @@ impl Manager {
         }
 
         // No live session for this branch. Resolve the worktree.
-        let (start_point, warning) = match start_point {
-            Some(sp) => (sp.to_string(), None),
+        let (start_point, mut warning) = match remote {
+            Some(r) => {
+                let warning = git::sync_with_origin(repo_path, base_branch, r.reset)
+                    .unwrap_or_else(|e| Some(e.to_string()));
+                (format!("origin/{base_branch}"), warning)
+            }
             None => refresh_default_branch(repo_path, &repo.default_branch),
         };
         let wt_path = if base_branch == repo.default_branch {
@@ -409,6 +422,13 @@ impl Manager {
         } else {
             self.find_or_create_worktree(&repo, base_branch, &start_point)?
         };
+        // The worktree is created --no-track (right for branches off the default
+        // branch); a reviewed branch should track its remote so status shows behind/ahead.
+        if remote.is_some() {
+            if let Err(e) = git::set_upstream_origin(repo_path, base_branch) {
+                warning.get_or_insert(e.to_string());
+            }
+        }
 
         // Honor the user-typed session name (or fall back to sanitized branch).
         let chosen_name = if session_name.is_empty() {
@@ -1665,37 +1685,119 @@ mod reuse_tests {
         assert_eq!(git_out(&repo, &["rev-parse", "main"]), main_before);
     }
 
-    #[test]
-    fn create_session_with_a_start_point_roots_the_worktree_there_not_at_the_default_branch() {
+    /// A repo whose origin has a unique branch `r` (with a commit beyond main).
+    struct ReviewFixture {
+        _tmp: tempfile::TempDir,
+        repo: PathBuf,
+        wts: PathBuf,
+        branch: String,
+        tip: String,
+        mgr: Manager,
+        _guard: SessionGuard,
+    }
+
+    fn review_fixture(suffix: &str) -> ReviewFixture {
         use crate::git::tests::{git_out, repo_behind_origin};
         let tmp = tempdir().unwrap();
-        let (repo, main_tip) = repo_behind_origin(tmp.path());
+        let (repo, _) = repo_behind_origin(tmp.path());
         let pusher = tmp.path().canonicalize().unwrap().join("pusher");
-        let remote_branch = unique_branch("remote-only");
+        let branch = unique_branch(suffix);
         git_out(&pusher, &["commit", "--allow-empty", "-qm", "their work"]);
-        let review_tip = git_out(&pusher, &["rev-parse", "HEAD"]);
-        git_out(&pusher, &["push", "-q", "origin", &format!("HEAD:refs/heads/{remote_branch}")]);
-        crate::git::fetch_branch(repo.to_str().unwrap(), &remote_branch).unwrap();
+        let tip = git_out(&pusher, &["rev-parse", "HEAD"]);
+        git_out(&pusher, &["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")]);
+        crate::git::fetch_branch(repo.to_str().unwrap(), &branch).unwrap();
         let wts = tmp.path().canonicalize().unwrap().join("wts");
-
         let mgr = make_manager();
         crate::db::set_config(&mgr.conn, "worktrees_dir", wts.to_str().unwrap());
-        let _guard = SessionGuard(crate::tmux::sanitize_session_name(&remote_branch));
+        let guard = SessionGuard(crate::tmux::sanitize_session_name(&branch));
+        ReviewFixture { _tmp: tmp, repo, wts, branch, tip, mgr, _guard: guard }
+    }
 
-        let (_, warning) = mgr
-            .create_session(
-                repo.to_str().unwrap(),
-                &remote_branch,
-                "",
-                None,
-                None,
-                Some(&format!("origin/{remote_branch}")),
-            )
-            .unwrap();
+    impl ReviewFixture {
+        fn create(&self, reset: bool) -> Option<String> {
+            self.mgr
+                .create_session(
+                    self.repo.to_str().unwrap(),
+                    &self.branch,
+                    "",
+                    None,
+                    None,
+                    Some(RemoteStart { reset }),
+                )
+                .unwrap()
+                .1
+        }
 
-        assert_eq!(warning, None);
-        let wt = wts.join("repo").join(remote_branch.replace('/', "-"));
-        assert_eq!(git_out(&wt, &["rev-parse", "HEAD"]), review_tip);
-        assert_ne!(review_tip, main_tip);
+        fn wt(&self) -> PathBuf {
+            self.wts.join("repo").join(self.branch.replace('/', "-"))
+        }
+
+        fn config(&self, key: &str) -> String {
+            crate::git::tests::git_out(&self.repo, &["config", &format!("branch.{}.{key}", self.branch)])
+        }
+    }
+
+    #[test]
+    fn remote_review_of_a_new_branch_roots_at_origin_and_tracks_it() {
+        use crate::git::tests::git_out;
+        let f = review_fixture("rv-new");
+        assert_eq!(f.create(false), None);
+        assert_eq!(git_out(&f.wt(), &["rev-parse", "HEAD"]), f.tip);
+        assert_eq!(f.config("remote"), "origin");
+        assert_eq!(f.config("merge"), format!("refs/heads/{}", f.branch));
+    }
+
+    #[test]
+    fn remote_review_fast_forwards_a_stale_local_branch_and_sets_its_upstream() {
+        use crate::git::tests::git_out;
+        let f = review_fixture("rv-stale");
+        git_out(&f.repo, &["branch", &f.branch, "main"]);
+        assert_eq!(f.create(false), None);
+        assert_eq!(git_out(&f.wt(), &["rev-parse", "HEAD"]), f.tip);
+        assert_eq!(f.config("remote"), "origin");
+    }
+
+    #[test]
+    fn remote_review_keeps_a_diverged_branch_unless_reset_and_still_tracks() {
+        use crate::git::tests::git_out;
+        let f = review_fixture("rv-div");
+        git_out(&f.repo, &["checkout", "-q", "-b", &f.branch, "main"]);
+        git_out(&f.repo, &["commit", "--allow-empty", "-qm", "local-only"]);
+        let local = git_out(&f.repo, &["rev-parse", "HEAD"]);
+        git_out(&f.repo, &["checkout", "-q", "main"]);
+
+        let warning = f.create(false);
+        assert!(warning.unwrap().contains("local-only"));
+        assert_eq!(git_out(&f.wt(), &["rev-parse", "HEAD"]), local);
+        assert_eq!(f.config("remote"), "origin");
+    }
+
+    #[test]
+    fn remote_review_with_reset_moves_a_diverged_branch_to_origin() {
+        use crate::git::tests::git_out;
+        let f = review_fixture("rv-reset");
+        git_out(&f.repo, &["checkout", "-q", "-b", &f.branch, "main"]);
+        git_out(&f.repo, &["commit", "--allow-empty", "-qm", "local-only"]);
+        git_out(&f.repo, &["checkout", "-q", "main"]);
+
+        assert_eq!(f.create(true), None);
+        assert_eq!(git_out(&f.wt(), &["rev-parse", "HEAD"]), f.tip);
+    }
+
+    #[test]
+    fn remote_review_leaves_a_dirty_existing_worktree_alone_with_a_warning() {
+        use crate::git::tests::git_out;
+        let f = review_fixture("rv-dirty");
+        git_out(&f.repo, &["branch", &f.branch, "main"]);
+        let before = git_out(&f.repo, &["rev-parse", &f.branch]);
+        std::fs::create_dir_all(f.wt().parent().unwrap()).unwrap();
+        git_out(&f.repo, &["worktree", "add", "-q", f.wt().to_str().unwrap(), &f.branch]);
+        std::fs::write(f.wt().join("wip.txt"), "unsaved").unwrap();
+
+        let warning = f.create(false);
+        assert!(warning.unwrap().contains("uncommitted"));
+        assert_eq!(git_out(&f.wt(), &["rev-parse", "HEAD"]), before);
+        assert!(f.wt().join("wip.txt").exists());
     }
 }
+
