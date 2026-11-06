@@ -350,7 +350,11 @@ pub fn fetch_origin(repo_path: &str) -> Result<(), GitError> {
 pub fn fast_forward_branch(repo_path: &str, branch: &str) -> Result<(), GitError> {
     let output = match checked_out_at(repo_path, branch)? {
         Some(path) => run(&["merge", "--ff-only", &format!("origin/{}", branch)], Some(&path)),
-        None => run(&["fetch", "origin", &format!("{0}:{0}", branch)], Some(repo_path)),
+        // `fetch .` is a local ff-only ref update from the already-fetched tracking ref: no network.
+        None => run(
+            &["fetch", ".", &format!("refs/remotes/origin/{0}:refs/heads/{0}", branch)],
+            Some(repo_path),
+        ),
     };
     if !output.status.success() {
         return Err(GitError(format!(
