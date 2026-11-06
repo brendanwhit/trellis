@@ -154,7 +154,7 @@ pub fn refresh_default_branch(repo_path: &str, default_branch: &str) -> (String,
         );
     }
     let warning = git::fast_forward_branch(repo_path, default_branch).err().map(|e| e.to_string());
-    (format!("origin/{default_branch}"), warning)
+    (git::origin_ref(default_branch), warning)
 }
 
 /// Detect subsystem directories in a monorepo (e.g. workers/model_train, src/sojourner).

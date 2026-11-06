@@ -56,7 +56,7 @@ Claude Code needs no extension: panes without a trellis status file fall back to
 
 **History** (`H`) opens the agent's own resume picker (`<agent> -r`) in a new window of the selected live session, scoped to that session's directory.
 
-**Cleanup** (`c`) shows all worktrees with staleness detection (merged or remote-deleted branches). Select and bulk-delete.
+**Cleanup** (`c`) shows all worktrees with staleness detection (merged or remote-deleted branches). Opening it fetches `origin` once per repo and checks merges against `origin/<default>` (falling back to the local default if the fetch fails). Select and bulk-delete.
 
 **Actions menu** (`.`) opens a per-session menu — change branch, launch the agent, or adopt an unmanaged session.
 

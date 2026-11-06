@@ -70,6 +70,38 @@ struct StaleCheckInput {
     default_branch: String,
 }
 
+/// Fetches each distinct repo once, then compares against `origin/<default>`:
+/// local default is often behind origin, so merged PRs would look unmerged.
+/// A failed fetch or missing remote ref falls back to the local default.
+fn stale_paths(
+    inputs: &[StaleCheckInput],
+    mut fetch: impl FnMut(&str) -> Result<(), git::GitError>,
+) -> HashSet<String> {
+    let mut fetched = HashSet::new();
+    for input in inputs {
+        if fetched.insert(input.repo_path.as_str()) {
+            let _ = fetch(&input.repo_path);
+        }
+    }
+    inputs
+        .iter()
+        .filter(|input| {
+            let remote_default = git::origin_ref(&input.default_branch);
+            let into = if git::ref_exists(&input.repo_path, &remote_default) {
+                &remote_default
+            } else {
+                &input.default_branch
+            };
+            let merged = git::is_branch_merged(&input.repo_path, &input.branch, into)
+                .unwrap_or(false);
+            let has_remote = git::has_remote_branch(&input.repo_path, &input.branch)
+                .unwrap_or(true);
+            merged || !has_remote
+        })
+        .map(|input| input.path.clone())
+        .collect()
+}
+
 pub struct CleanupScreen {
     rows: Vec<WorktreeRow>,
     /// Selected rows, keyed by worktree path. Path is unique across both
@@ -163,21 +195,7 @@ impl CleanupScreen {
             .collect();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut stale_paths = HashSet::new();
-            for input in &inputs {
-                let merged = git::is_branch_merged(
-                    &input.repo_path,
-                    &input.branch,
-                    &input.default_branch,
-                )
-                .unwrap_or(false);
-                let has_remote = git::has_remote_branch(&input.repo_path, &input.branch)
-                    .unwrap_or(true);
-                if merged || !has_remote {
-                    stale_paths.insert(input.path.clone());
-                }
-            }
-            let _ = tx.send(stale_paths);
+            let _ = tx.send(stale_paths(&inputs, git::fetch_origin));
         });
 
         Self {
@@ -770,5 +788,74 @@ mod tests {
             paths.iter().filter(|p| Path::new(p).exists()).count() == 1,
             "the unselected worktree stays on disk"
         );
+    }
+
+    fn stale_input(repo: &Path, branch: &str) -> StaleCheckInput {
+        StaleCheckInput {
+            path: format!("/wt/{branch}"),
+            repo_path: repo.to_string_lossy().to_string(),
+            branch: branch.to_string(),
+            default_branch: "main".to_string(),
+        }
+    }
+
+    /// Local `main` is behind origin; `merged` is in origin/main only, `open` is
+    /// pushed but unmerged. Both still exist on origin.
+    fn repo_with_branches_merged_on_origin(root: &Path) -> std::path::PathBuf {
+        let (repo, _) = git::tests::repo_behind_origin(root);
+        let git = |dir: &Path, args: &[&str]| git::tests::git_out(dir, args);
+        for branch in ["merged", "open"] {
+            git(&repo, &["checkout", "-q", "-b", branch, "main"]);
+            git(&repo, &["commit", "--allow-empty", "-qm", branch]);
+            git(&repo, &["push", "-q", "origin", branch]);
+        }
+        git(&repo, &["checkout", "-q", "main"]);
+        let pusher = repo.parent().unwrap().join("pusher");
+        git(&pusher, &["fetch", "-q", "origin"]);
+        git(&pusher, &["merge", "-q", "--no-ff", "-m", "merge", "origin/merged"]);
+        git(&pusher, &["push", "-q", "origin", "main"]);
+        repo
+    }
+
+    #[test]
+    fn stale_check_compares_against_fetched_origin_default() {
+        let tmp = tempdir().unwrap();
+        let repo = repo_with_branches_merged_on_origin(tmp.path());
+        let inputs = [stale_input(&repo, "merged"), stale_input(&repo, "open")];
+
+        let stale = stale_paths(&inputs, git::fetch_origin);
+
+        assert!(stale.contains(&inputs[0].path), "merged on origin must be stale");
+        assert!(!stale.contains(&inputs[1].path), "unmerged branch must stay non-stale");
+    }
+
+    #[test]
+    fn stale_check_falls_back_to_local_default_when_fetch_fails() {
+        let tmp = tempdir().unwrap();
+        let repo = repo_with_branches_merged_on_origin(tmp.path());
+        // Merged into local main only; origin is unreachable.
+        git::tests::git_out(&repo, &["branch", "local-merged", "main"]);
+        git::tests::git_out(&repo, &["remote", "set-url", "origin", "/nonexistent/origin.git"]);
+        let inputs = [stale_input(&repo, "local-merged"), stale_input(&repo, "merged")];
+
+        let stale = stale_paths(&inputs, git::fetch_origin);
+
+        assert!(stale.contains(&inputs[0].path));
+        assert!(!stale.contains(&inputs[1].path), "origin unknown, local main lacks it");
+    }
+
+    #[test]
+    fn stale_check_fetches_each_repo_once() {
+        let tmp = tempdir().unwrap();
+        let repo = repo_with_branches_merged_on_origin(tmp.path());
+        let inputs = [stale_input(&repo, "merged"), stale_input(&repo, "open")];
+        let mut fetched = Vec::new();
+
+        stale_paths(&inputs, |repo_path| {
+            fetched.push(repo_path.to_string());
+            Ok(())
+        });
+
+        assert_eq!(fetched, vec![inputs[0].repo_path.clone()]);
     }
 }
