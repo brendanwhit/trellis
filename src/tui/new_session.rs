@@ -211,6 +211,8 @@ pub struct NewSessionScreen {
     /// Entries of `branches` that exist only on `origin`.
     remote_only_branches: HashSet<String>,
     branch_job: Option<Job<Result<Vec<String>, String>>>,
+    /// The branch-step fetch of `origin` succeeded, so creating a session need not fetch again.
+    origin_fetched: bool,
     pick_job: Option<Job<Result<(String, BranchSync), String>>>,
     // Reset-confirmation step: commits the local copy of the picked branch has beyond origin.
     local_only: usize,
@@ -347,6 +349,7 @@ impl NewSessionScreen {
             selected_branch: None,
             selected_remote: false,
             reset_to_origin: false,
+            origin_fetched: false,
             selected_agent: None,
             session_name: String::new(),
             filter_input: String::new(),
@@ -400,6 +403,7 @@ impl NewSessionScreen {
         self.remote_only_branches.clear();
         self.selected_remote = false;
         self.reset_to_origin = false;
+        self.origin_fetched = false;
         let gh = self.gh;
         let path = repo.path.clone();
         self.branch_job = Some(Job::spawn("Fetching remote branches", None, move |tx| {
@@ -513,7 +517,7 @@ impl NewSessionScreen {
 
         let subdir_ref = subdirectory.as_deref();
 
-        match manager.create_session(&repo.path, branch, &self.session_name, subdir_ref, self.selected_agent.as_deref(), self.remote_start()) {
+        match manager.create_session(&repo.path, branch, &self.session_name, subdir_ref, self.selected_agent.as_deref(), self.remote_start(), self.origin_fetched) {
             Ok((_, warning)) => {
                 let _ = tmux::switch_client(&self.session_name);
                 if let Some(w) = warning {
@@ -635,6 +639,7 @@ impl NewSessionScreen {
             return;
         }
         self.branch_job = None;
+        self.origin_fetched = matches!(result, Some(Ok(_)));
         match result {
             Some(Ok(remote)) if self.step == Step::PickBranch => self.merge_remote_branches(remote),
             // Local branches still work offline; say why the remote ones are missing.
@@ -2029,6 +2034,19 @@ mod tests {
         screen.handle_event(&esc, &mut manager);
         assert_eq!(screen.step, Step::PickBranch);
         assert!(screen.remote_start().is_none());
+    }
+
+    #[test]
+    fn origin_counts_as_fetched_only_once_the_branch_step_fetch_succeeds() {
+        let (mut screen, mut manager, _tmp) = branch_screen(gh_with_remote_branches());
+        assert!(!screen.origin_fetched, "false while the fetch is in flight");
+        settle(&mut screen, &mut manager, |s| s.branch_job.is_none());
+        assert!(screen.origin_fetched);
+
+        let gh = Gh { remote_branches: |_| Err(GitError("offline".into())), ..gh_with_remote_branches() };
+        let (mut screen, mut manager, _tmp) = branch_screen(gh);
+        settle(&mut screen, &mut manager, |s| s.branch_job.is_none());
+        assert!(!screen.origin_fetched, "a failed fetch must keep the blocking fallback");
     }
 
     #[test]
