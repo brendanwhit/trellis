@@ -293,6 +293,16 @@ pub fn fast_forward_branch(repo_path: &str, branch: &str) -> Result<(), GitError
     Ok(())
 }
 
+pub fn origin_ref(branch: &str) -> String {
+    format!("origin/{branch}")
+}
+
+pub fn ref_exists(repo_path: &str, name: &str) -> bool {
+    run(&["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")], Some(repo_path))
+        .status
+        .success()
+}
+
 pub fn fetch_branch(repo_path: &str, branch: &str) {
     run(&["fetch", "origin", branch], Some(repo_path));
 }
