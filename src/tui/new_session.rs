@@ -27,6 +27,10 @@ enum Step {
     /// A reviewed branch's local copy has commits origin lacks: keep or reset.
     ConfirmReset,
     PickCloneDir,
+    /// New repo: which account or org owns it.
+    PickOwner,
+    /// New repo: its name.
+    EnterName,
     PickAgent,
     PickSubsystem,
 }
@@ -50,6 +54,8 @@ fn agent_choices(default: &str) -> Vec<String> {
 struct Gh {
     list_repos: fn() -> Result<Vec<String>, GitError>,
     clone: fn(&str, &Path) -> Result<(), GitError>,
+    owners: fn() -> Result<Vec<String>, GitError>,
+    create_repo: fn(&str) -> Result<(), GitError>,
     remote_branches: fn(&str) -> Result<Vec<String>, GitError>,
     fetch_branch: fn(&str, &str) -> Result<(), GitError>,
     pr_branch: fn(&str, i64) -> Result<String, GitError>,
@@ -58,6 +64,8 @@ struct Gh {
 const REAL_GH: Gh = Gh {
     list_repos: git::list_github_repos,
     clone: git::clone_github_repo,
+    owners: git::github_owners,
+    create_repo: git::create_github_repo,
     remote_branches: git::fetch_remote_branches,
     fetch_branch: git::fetch_branch,
     pr_branch: git::get_pr_branch,
@@ -147,6 +155,23 @@ fn clone_or_reuse(gh: Gh, slug: &str, dest: &Path) -> Result<SelectedRepo, Strin
     })
 }
 
+/// Create the repo on GitHub, then clone it like any remote repo.
+fn create_and_clone(gh: Gh, slug: &str, dest: &Path) -> Result<SelectedRepo, String> {
+    (gh.create_repo)(slug).map_err(|e| e.to_string())?;
+    clone_or_reuse(gh, slug, dest)
+}
+
+/// GitHub's repo-name charset; `.` and `..` are reserved.
+fn validate_repo_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Enter a repo name.".to_string());
+    }
+    if name == "." || name == ".." || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        return Err("Repo names may only use letters, digits, '.', '_' and '-'.".to_string());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // NewSessionScreen
 // ---------------------------------------------------------------------------
@@ -165,6 +190,14 @@ pub struct NewSessionScreen {
     clone_dirs: Vec<String>,
     filtered_clone_dirs: Vec<String>,
     clone_dir_list_state: ListState,
+    // New-repo steps: owner choices, the chosen owner, and whether the pending
+    // clone should create the repo first.
+    owners: Vec<String>,
+    filtered_owners: Vec<String>,
+    owner_list_state: ListState,
+    new_repo_owner: Option<String>,
+    creating_repo: bool,
+    owners_job: Option<Job<Result<Vec<String>, String>>>,
     fetch_job: Option<Job<Result<Vec<String>, String>>>,
     clone_job: Option<Job<Result<SelectedRepo, String>>>,
     repo_list_state: ListState,
@@ -286,6 +319,12 @@ impl NewSessionScreen {
             clone_dirs: Vec::new(),
             filtered_clone_dirs: Vec::new(),
             clone_dir_list_state: ListState::default(),
+            owners: Vec::new(),
+            filtered_owners: Vec::new(),
+            owner_list_state: ListState::default(),
+            new_repo_owner: None,
+            creating_repo: false,
+            owners_job: None,
             fetch_job: Some(fetch_job),
             clone_job: None,
             repo_list_state,
@@ -336,6 +375,8 @@ impl NewSessionScreen {
         self.filter_cursor = 0;
         self.error.clear();
         self.awaiting_repo_path = false;
+        self.creating_repo = false;
+        self.new_repo_owner = None;
         self.filtered_dirs = self.dev_dirs.clone();
         self.repo_list_state = ListState::default();
         if !self.filtered_dirs.is_empty() {
@@ -524,6 +565,31 @@ impl NewSessionScreen {
         }
     }
 
+    fn apply_owners_results(&mut self) {
+        let Some(job) = self.owners_job.as_mut() else {
+            return;
+        };
+        let result = job.drain().pop();
+        if result.is_none() && !job.finished() {
+            return;
+        }
+        self.owners_job = None;
+        match result {
+            Some(Ok(owners)) if owners.is_empty() => self.error = "No GitHub account found.".to_string(),
+            Some(Ok(owners)) => {
+                self.owners = owners;
+                if let [only] = self.owners.as_slice() {
+                    self.new_repo_owner = Some(only.clone());
+                    self.go_to_name_step("");
+                } else {
+                    self.go_to_owner_step();
+                }
+            }
+            Some(Err(e)) => self.error = format!("GitHub owners unavailable: {}", e),
+            None => self.error = "Owner lookup failed.".to_string(),
+        }
+    }
+
     fn apply_clone_results(&mut self) {
         let Some(job) = self.clone_job.as_mut() else {
             return;
@@ -536,6 +602,7 @@ impl NewSessionScreen {
         match result {
             Some(Ok(repo)) => {
                 self.selected_repo = Some(repo);
+                self.creating_repo = false;
                 self.go_to_branch_step();
             }
             Some(Err(e)) => self.error = e,
@@ -628,11 +695,97 @@ impl NewSessionScreen {
     fn start_clone(&mut self, repos_dir: &Path, slug: String) {
         let dest = clone_dest(repos_dir, &slug);
         let gh = self.gh;
+        let create = self.creating_repo;
         self.error.clear();
-        self.clone_job = Some(Job::spawn(format!("Cloning {}", slug), None, move |tx| {
-            let _ = tx.send(JobMsg::Item(clone_or_reuse(gh, &slug, &dest)));
+        let label = if create { format!("Creating {}", slug) } else { format!("Cloning {}", slug) };
+        self.clone_job = Some(Job::spawn(label, None, move |tx| {
+            let result = if create { create_and_clone(gh, &slug, &dest) } else { clone_or_reuse(gh, &slug, &dest) };
+            let _ = tx.send(JobMsg::Item(result));
             let _ = tx.send(JobMsg::Done);
         }));
+    }
+
+    fn start_owner_lookup(&mut self) {
+        let gh = self.gh;
+        self.error.clear();
+        self.owners_job = Some(Job::spawn("Loading GitHub owners", None, move |tx| {
+            let _ = tx.send(JobMsg::Item((gh.owners)().map_err(|e| e.to_string())));
+            let _ = tx.send(JobMsg::Done);
+        }));
+    }
+
+    fn go_to_owner_step(&mut self) {
+        self.step = Step::PickOwner;
+        self.filtered_owners = self.owners.clone();
+        self.owner_list_state = ListState::default();
+        self.owner_list_state.select(Some(0));
+        self.filter_input.clear();
+        self.filter_cursor = 0;
+        self.error.clear();
+    }
+
+    fn go_to_name_step(&mut self, name: &str) {
+        self.step = Step::EnterName;
+        self.filter_input = name.to_string();
+        self.filter_cursor = name.chars().count();
+        self.error.clear();
+    }
+
+    fn confirm_owner(&mut self) -> ScreenAction {
+        let Some(owner) = self
+            .owner_list_state
+            .selected()
+            .and_then(|i| self.filtered_owners.get(i))
+            .cloned()
+        else {
+            return ScreenAction::None;
+        };
+        self.new_repo_owner = Some(owner);
+        self.go_to_name_step("");
+        ScreenAction::None
+    }
+
+    /// A listed local or remote repo already has this name (case-insensitive).
+    fn repo_name_taken(&self, owner: &str, name: &str) -> bool {
+        self.dev_dirs.iter().any(|(_, path)| {
+            if self.remote_slugs.contains(path) {
+                path.eq_ignore_ascii_case(&format!("{}/{}", owner, name))
+            } else {
+                Path::new(path).file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name))
+            }
+        })
+    }
+
+    fn confirm_name(&mut self, manager: &Manager) -> ScreenAction {
+        let name = self.filter_input.trim().to_string();
+        let owner = self.new_repo_owner.clone().unwrap_or_default();
+        if let Err(e) = validate_repo_name(&name) {
+            self.error = e;
+            return ScreenAction::None;
+        }
+        if self.repo_name_taken(&owner, &name) {
+            self.error = format!("A repo named '{}' already exists.", name);
+            return ScreenAction::None;
+        }
+        self.creating_repo = true;
+        let slug = format!("{}/{}", owner, name);
+        let dirs = manager.repos_dirs();
+        if let [only] = dirs.as_slice() {
+            self.pending_clone = Some(slug.clone());
+            self.start_clone(only, slug);
+        } else {
+            self.go_to_clone_dir_step(slug, &dirs);
+        }
+        ScreenAction::None
+    }
+
+    /// Back from name entry: to the owner list, or PickRepo when it was skipped.
+    fn leave_name_step(&mut self) {
+        if self.owners.len() > 1 {
+            self.go_to_owner_step();
+        } else {
+            self.go_to_repo_step();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -726,7 +879,20 @@ impl NewSessionScreen {
                     self.clone_dir_list_state.select(Some(0));
                 }
             }
-            Step::PickAgent | Step::ConfirmReset => {}
+            Step::PickOwner => {
+                let mut scored: Vec<(String, i32)> = self
+                    .owners
+                    .iter()
+                    .filter_map(|o| crate::fuzzy::fuzzy_match_multi(&query, o).map(|s| (o.clone(), s)))
+                    .collect();
+                scored.sort_by_key(|(_, s)| *s);
+                self.filtered_owners = scored.into_iter().map(|(o, _)| o).collect();
+                self.owner_list_state = ListState::default();
+                if !self.filtered_owners.is_empty() {
+                    self.owner_list_state.select(Some(0));
+                }
+            }
+            Step::PickAgent | Step::ConfirmReset | Step::EnterName => {}
             Step::PickSubsystem => {
                 let mut scored: Vec<(String, i32)> = self
                     .subsystems
@@ -748,9 +914,11 @@ impl NewSessionScreen {
 
     fn list_len(&self) -> usize {
         match self.step {
-            Step::PickRepo => self.filtered_dirs.len() + 1, // +1 for "add repo"
+            Step::PickRepo => self.filtered_dirs.len() + 2, // +2 for "add repo" and "create repo"
             Step::PickBranch => self.filtered_branches.len() + self.extra_rows().len(),
             Step::PickCloneDir => self.filtered_clone_dirs.len(),
+            Step::PickOwner => self.filtered_owners.len(),
+            Step::EnterName => 0,
             Step::ConfirmReset => 2,
             Step::PickAgent => self.agents.len(),
             Step::PickSubsystem => self.filtered_subsystems.len() + 1, // +1 for root
@@ -778,6 +946,8 @@ impl NewSessionScreen {
             Step::PickRepo => self.repo_list_state.selected(),
             Step::PickBranch => self.branch_list_state.selected(),
             Step::PickCloneDir => self.clone_dir_list_state.selected(),
+            Step::PickOwner => self.owner_list_state.selected(),
+            Step::EnterName => None,
             Step::ConfirmReset => self.reset_list_state.selected(),
             Step::PickAgent => self.agent_list_state.selected(),
             Step::PickSubsystem => self.subsystem_list_state.selected(),
@@ -789,6 +959,8 @@ impl NewSessionScreen {
             Step::PickRepo => self.repo_list_state.select(Some(idx)),
             Step::PickBranch => self.branch_list_state.select(Some(idx)),
             Step::PickCloneDir => self.clone_dir_list_state.select(Some(idx)),
+            Step::PickOwner => self.owner_list_state.select(Some(idx)),
+            Step::EnterName => {}
             Step::ConfirmReset => self.reset_list_state.select(Some(idx)),
             Step::PickAgent => self.agent_list_state.select(Some(idx)),
             Step::PickSubsystem => self.subsystem_list_state.select(Some(idx)),
@@ -814,6 +986,8 @@ impl NewSessionScreen {
             Step::PickRepo => self.confirm_repo(manager),
             Step::PickBranch => self.confirm_branch(manager),
             Step::PickCloneDir => self.confirm_clone_dir(),
+            Step::PickOwner => self.confirm_owner(),
+            Step::EnterName => self.confirm_name(manager),
             Step::ConfirmReset => self.confirm_reset(manager),
             Step::PickAgent => self.confirm_agent(manager),
             Step::PickSubsystem => self.confirm_subsystem(manager),
@@ -833,6 +1007,10 @@ impl NewSessionScreen {
                 }
             }
         };
+        if idx == self.filtered_dirs.len() + 1 {
+            self.start_owner_lookup();
+            return ScreenAction::None;
+        }
         if idx >= self.filtered_dirs.len() {
             // "Add repo" item
             self.enter_repo_path_mode();
@@ -874,8 +1052,11 @@ impl NewSessionScreen {
         else {
             return ScreenAction::None;
         };
-        let slug = self.pending_clone.take().unwrap_or_default();
-        self.go_to_repo_step();
+        let slug = self.pending_clone.clone().unwrap_or_default();
+        // A create stays put so a failure leaves the user on this step.
+        if !self.creating_repo {
+            self.go_to_repo_step();
+        }
         self.start_clone(Path::new(&dir), slug);
         ScreenAction::None
     }
@@ -934,6 +1115,8 @@ impl NewSessionScreen {
                 "Clone {} into...",
                 self.pending_clone.as_deref().unwrap_or("?")
             ),
+            Step::PickOwner => "New repo - Select Owner".to_string(),
+            Step::EnterName => format!("New repo - Name ({})", self.new_repo_owner.as_deref().unwrap_or("?")),
             Step::PickAgent => {
                 let repo_name = self.selected_repo.as_ref().map(|r| r.name.as_str()).unwrap_or("?");
                 format!("Step 3 - Agent ({})", repo_name)
@@ -953,6 +1136,8 @@ impl NewSessionScreen {
             Step::PickRepo => "Type to filter. Enter to select. Escape to cancel.",
             Step::PickBranch => "Type to filter, a new branch name, or a PR number. Enter to confirm.",
             Step::PickCloneDir => "Pick the directory to clone into. Enter to confirm. Escape to go back.",
+            Step::PickOwner => "Pick the account or org that will own the repo. Enter to confirm. Escape to go back.",
+            Step::EnterName => "Name the new private repo. Enter to create and clone it. Escape to go back.",
             Step::ConfirmReset => "Reset discards them from the branch (recoverable via reflog). Enter to confirm. Escape to go back.",
             Step::PickAgent => "Pick the agent to launch. Enter to confirm. Escape to go back.",
             Step::PickSubsystem => "Pick a subsystem to start in, or select root. Enter to confirm.",
@@ -967,6 +1152,8 @@ impl NewSessionScreen {
             Step::PickRepo => "Filter repos...",
             Step::PickBranch => "Filter, new branch, or PR number...",
             Step::PickCloneDir => "Filter directories...",
+            Step::PickOwner => "Filter owners...",
+            Step::EnterName => "Repo name...",
             Step::PickAgent | Step::ConfirmReset => "",
             Step::PickSubsystem => "Filter...",
         }
@@ -989,6 +1176,10 @@ impl NewSessionScreen {
                     .collect();
                 items.push(ListItem::new(Span::styled(
                     "+ Add new repo path...",
+                    Style::default().fg(theme::GREEN),
+                )));
+                items.push(ListItem::new(Span::styled(
+                    "+ Create new repo...",
                     Style::default().fg(theme::GREEN),
                 )));
                 items
@@ -1022,6 +1213,12 @@ impl NewSessionScreen {
                 .iter()
                 .map(|d| ListItem::new(Span::styled(d.as_str(), Style::default().fg(theme::TEXT))))
                 .collect(),
+            Step::PickOwner => self
+                .filtered_owners
+                .iter()
+                .map(|o| ListItem::new(Span::styled(o.as_str(), Style::default().fg(theme::TEXT))))
+                .collect(),
+            Step::EnterName => Vec::new(),
             Step::ConfirmReset => {
                 let origin = format!("Reset to origin/{}", self.selected_branch.as_deref().unwrap_or("?"));
                 ["Keep local branch as is".to_string(), origin]
@@ -1095,6 +1292,7 @@ impl ScreenBehavior for NewSessionScreen {
                 Step::PickRepo => &self.repo_list_state,
                 Step::PickBranch => &self.branch_list_state,
                 Step::PickCloneDir => &self.clone_dir_list_state,
+                Step::PickOwner | Step::EnterName => &self.owner_list_state,
                 Step::ConfirmReset => &self.reset_list_state,
                 Step::PickAgent => &self.agent_list_state,
                 Step::PickSubsystem => &self.subsystem_list_state,
@@ -1131,6 +1329,7 @@ impl ScreenBehavior for NewSessionScreen {
             .clone_job
             .as_ref()
             .map(|j| j.indicator_line())
+            .or_else(|| self.owners_job.as_ref().map(|j| j.indicator_line()))
             .or_else(|| self.pick_job.as_ref().map(|j| j.indicator_line()))
             .or_else(|| self.fetch_job.as_ref().map(|j| j.indicator_line()))
             .or_else(|| self.branch_job.as_ref().map(|j| j.indicator_line()))
@@ -1141,13 +1340,14 @@ impl ScreenBehavior for NewSessionScreen {
 
     fn tick(&mut self, manager: &mut Manager) -> ScreenAction {
         self.apply_fetch_results();
+        self.apply_owners_results();
         self.apply_clone_results();
         self.apply_branch_job_results();
         self.apply_pick_results(manager)
     }
 
     fn handle_event(&mut self, event: &Event, manager: &mut Manager) -> ScreenAction {
-        if self.clone_job.is_some() || self.pick_job.is_some() {
+        if self.clone_job.is_some() || self.pick_job.is_some() || self.owners_job.is_some() {
             return ScreenAction::None;
         }
         if let Event::Key(KeyEvent { code, kind: KeyEventKind::Press, modifiers, .. }) = event {
@@ -1176,7 +1376,20 @@ impl ScreenBehavior for NewSessionScreen {
                             return ScreenAction::None;
                         }
                         Step::PickCloneDir => {
+                            if self.creating_repo {
+                                let name = repo_name(self.pending_clone.as_deref().unwrap_or("")).to_string();
+                                self.go_to_name_step(&name);
+                            } else {
+                                self.go_to_repo_step();
+                            }
+                            return ScreenAction::None;
+                        }
+                        Step::PickOwner => {
                             self.go_to_repo_step();
+                            return ScreenAction::None;
+                        }
+                        Step::EnterName => {
+                            self.leave_name_step();
                             return ScreenAction::None;
                         }
                         Step::PickAgent | Step::ConfirmReset => {
@@ -1314,6 +1527,8 @@ mod tests {
             clone: |_, dest| {
                 std::fs::create_dir_all(dest.join(".git")).map_err(|e| GitError(e.to_string()))
             },
+            owners: || Ok(vec!["me".to_string()]),
+            create_repo: |_| Ok(()),
             remote_branches: |_| Ok(Vec::new()),
             fetch_branch: |_, _| Ok(()),
             pr_branch: |_, n| Ok(format!("pr-{n}")),
@@ -1422,6 +1637,180 @@ mod tests {
         settle(&mut screen, &mut manager, |s| s.clone_job.is_none());
         assert_eq!(screen.step, Step::PickRepo);
         assert!(screen.error.contains("boom"));
+    }
+
+    static CREATED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn gh_creating() -> Gh {
+        Gh {
+            create_repo: |slug| {
+                CREATED.lock().unwrap().push(slug.to_string());
+                Ok(())
+            },
+            ..gh_ok_listing()
+        }
+    }
+
+    fn press(screen: &mut NewSessionScreen, manager: &mut Manager, code: KeyCode) {
+        let ev = Event::Key(KeyEvent::new(code, crossterm::event::KeyModifiers::NONE));
+        screen.handle_event(&ev, manager);
+    }
+
+    /// Select the "+ Create new repo..." row and wait for the owner lookup to land.
+    fn start_create(screen: &mut NewSessionScreen, manager: &mut Manager) {
+        settle(screen, manager, |s| s.fetch_job.is_none());
+        screen.select_index(screen.list_len() - 1);
+        press_enter(screen, manager);
+        assert!(screen.owners_job.is_some(), "lookup runs on a job");
+        settle(screen, manager, |s| s.owners_job.is_none());
+    }
+
+    #[test]
+    fn repo_names_accepted_are_nonempty_github_charset_and_never_dot_entries() {
+        let candidates = ["", ".", "..", "a", "a.b", "a_b-c", "A1", "a b", "a/b", "a\u{e9}", "-", "...", "a!", " "];
+        for name in candidates {
+            if validate_repo_name(name).is_ok() {
+                assert!(!name.is_empty() && name != "." && name != "..", "{name:?}");
+                assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)), "{name:?}");
+            }
+        }
+        assert!(validate_repo_name("fine-name_1.x").is_ok());
+        for bad in ["", ".", "..", "a b", "a/b"] {
+            assert!(validate_repo_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn with_a_single_owner_the_owner_step_is_skipped() {
+        let (mut screen, mut manager, _tmp) = screen_with(gh_creating());
+        start_create(&mut screen, &mut manager);
+        assert_eq!(screen.step, Step::EnterName);
+        assert_eq!(screen.new_repo_owner.as_deref(), Some("me"));
+    }
+
+    #[test]
+    fn creating_a_repo_picks_owner_then_name_then_creates_and_clones_into_pick_branch() {
+        let gh = Gh { owners: || Ok(vec!["me".into(), "acme".into()]), ..gh_creating() };
+        let (mut screen, mut manager, tmp) = screen_with(gh);
+        start_create(&mut screen, &mut manager);
+        assert_eq!(screen.step, Step::PickOwner);
+        assert_eq!(screen.filtered_owners, ["me", "acme"], "login first");
+        assert_eq!(screen.owner_list_state.selected(), Some(0));
+        screen.move_selection(1);
+        press_enter(&mut screen, &mut manager);
+        assert_eq!(screen.step, Step::EnterName);
+
+        type_str(&mut screen, &mut manager, "wiring-new");
+        press_enter(&mut screen, &mut manager);
+        assert!(screen.clone_job.is_some(), "create+clone runs on a job");
+        settle(&mut screen, &mut manager, |s| s.clone_job.is_none());
+
+        assert!(CREATED.lock().unwrap().contains(&"acme/wiring-new".to_string()));
+        assert_eq!(screen.step, Step::PickBranch);
+        let repo = screen.selected_repo.as_ref().unwrap();
+        assert_eq!(repo.name, "wiring-new");
+        assert_eq!(Path::new(&repo.path), tmp.path().join("wiring-new"));
+    }
+
+    #[test]
+    fn several_repos_dirs_ask_for_the_destination_and_escape_returns_to_the_name() {
+        let (mut screen, mut manager, a, b) = two_dir_screen();
+        screen.select_index(screen.list_len() - 1);
+        press_enter(&mut screen, &mut manager);
+        settle(&mut screen, &mut manager, |s| s.owners_job.is_none());
+        type_str(&mut screen, &mut manager, "dest-new");
+        press_enter(&mut screen, &mut manager);
+        assert_eq!(screen.step, Step::PickCloneDir);
+        assert!(screen.clone_job.is_none());
+
+        press(&mut screen, &mut manager, KeyCode::Esc);
+        assert_eq!(screen.step, Step::EnterName);
+        assert_eq!(screen.filter_input, "dest-new");
+
+        press_enter(&mut screen, &mut manager);
+        screen.move_selection(1);
+        press_enter(&mut screen, &mut manager);
+        settle(&mut screen, &mut manager, |s| s.clone_job.is_none());
+        assert_eq!(screen.step, Step::PickBranch);
+        assert_eq!(Path::new(&screen.selected_repo.as_ref().unwrap().path), b.path().join("dest-new"));
+        assert!(!a.path().join("dest-new").exists());
+    }
+
+    #[test]
+    fn invalid_or_duplicate_names_are_rejected_before_anything_is_created() {
+        let (mut screen, mut manager, tmp) = screen_with(Gh {
+            owners: || Ok(vec!["o".into()]),
+            ..gh_creating()
+        });
+        std::fs::create_dir_all(tmp.path().join("LocalRepo/.git")).unwrap();
+        screen.dev_dirs = vec![("LocalRepo".into(), tmp.path().join("LocalRepo").to_string_lossy().to_string())];
+        settle(&mut screen, &mut manager, |s| s.fetch_job.is_none());
+        screen.filtered_dirs = screen.dev_dirs.clone();
+        screen.select_index(screen.list_len() - 1);
+        press_enter(&mut screen, &mut manager);
+        settle(&mut screen, &mut manager, |s| s.owners_job.is_none());
+        assert_eq!(screen.step, Step::EnterName);
+
+        for name in ["", "bad name", "..", "localrepo", "remote-one", "Remote-One"] {
+            screen.go_to_name_step(name);
+            press_enter(&mut screen, &mut manager);
+            assert_eq!(screen.step, Step::EnterName, "{name:?}");
+            assert!(!screen.error.is_empty(), "{name:?}");
+            assert!(screen.clone_job.is_none(), "{name:?}");
+        }
+        assert!(CREATED.lock().unwrap().iter().all(|s| !s.starts_with("o/")));
+    }
+
+    #[test]
+    fn failed_create_stays_on_the_name_step_with_the_error() {
+        let gh = Gh { create_repo: |_| Err(GitError("name already exists".into())), ..gh_ok_listing() };
+        let (mut screen, mut manager, tmp) = screen_with(gh);
+        start_create(&mut screen, &mut manager);
+        type_str(&mut screen, &mut manager, "taken");
+        press_enter(&mut screen, &mut manager);
+        settle(&mut screen, &mut manager, |s| s.clone_job.is_none());
+        assert_eq!(screen.step, Step::EnterName);
+        assert!(screen.error.contains("name already exists"));
+        assert_eq!(screen.filter_input, "taken");
+        assert!(!tmp.path().join("taken").exists(), "no clone after a failed create");
+    }
+
+    #[test]
+    fn failed_create_with_several_dirs_stays_on_the_destination_step() {
+        let gh = Gh { create_repo: |_| Err(GitError("no permission".into())), ..gh_ok_listing() };
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_schema(&conn);
+        let mut manager = Manager::new(conn);
+        manager.set_config("repos_dir", &format!("{}\n{}", a.path().display(), b.path().display()));
+        let mut screen = NewSessionScreen::new_with(&manager, gh);
+        start_create(&mut screen, &mut manager);
+        type_str(&mut screen, &mut manager, "denied");
+        press_enter(&mut screen, &mut manager);
+        press_enter(&mut screen, &mut manager);
+        settle(&mut screen, &mut manager, |s| s.clone_job.is_none());
+        assert_eq!(screen.step, Step::PickCloneDir);
+        assert!(screen.error.contains("no permission"));
+    }
+
+    #[test]
+    fn escape_walks_back_through_the_new_repo_steps() {
+        let gh = Gh { owners: || Ok(vec!["me".into(), "acme".into()]), ..gh_creating() };
+        let (mut screen, mut manager, _tmp) = screen_with(gh);
+        start_create(&mut screen, &mut manager);
+        press_enter(&mut screen, &mut manager);
+        assert_eq!(screen.step, Step::EnterName);
+        press(&mut screen, &mut manager, KeyCode::Esc);
+        assert_eq!(screen.step, Step::PickOwner);
+        press(&mut screen, &mut manager, KeyCode::Esc);
+        assert_eq!(screen.step, Step::PickRepo);
+
+        let (mut screen, mut manager, _tmp) = screen_with(gh_creating());
+        start_create(&mut screen, &mut manager);
+        assert_eq!(screen.step, Step::EnterName);
+        press(&mut screen, &mut manager, KeyCode::Esc);
+        assert_eq!(screen.step, Step::PickRepo);
+        assert!(!screen.creating_repo);
     }
 
     static FETCHED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());

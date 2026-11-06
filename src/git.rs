@@ -310,16 +310,22 @@ pub fn origin_github_slug(repo_path: &str) -> Option<String> {
 
 /// Every non-archived repo (`owner/name`) of the authenticated GitHub user and
 /// their orgs. An owner whose listing fails (e.g. SAML) is skipped.
-pub fn list_github_repos() -> Result<Vec<String>, GitError> {
+/// The authenticated user's login first, then their orgs.
+pub fn github_owners() -> Result<Vec<String>, GitError> {
     let login = gh_stdout(&["api", "user", "--jq", ".login"])?;
     let orgs = gh_stdout(&["api", "user/orgs", "--paginate", "--jq", ".[].login"])?;
+    Ok(std::iter::once(login.trim())
+        .chain(orgs.lines().map(str::trim))
+        .filter(|o| !o.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+pub fn list_github_repos() -> Result<Vec<String>, GitError> {
     let mut repos = Vec::new();
-    for owner in std::iter::once(login.trim()).chain(orgs.lines().map(str::trim)) {
-        if owner.is_empty() {
-            continue;
-        }
+    for owner in github_owners()? {
         let listing = gh_stdout(&[
-            "repo", "list", owner, "--limit", "1000", "--no-archived",
+            "repo", "list", &owner, "--limit", "1000", "--no-archived",
             "--json", "nameWithOwner", "--jq", ".[].nameWithOwner",
         ]);
         if let Ok(listing) = listing {
@@ -329,6 +335,11 @@ pub fn list_github_repos() -> Result<Vec<String>, GitError> {
     repos.sort();
     repos.dedup();
     Ok(repos)
+}
+
+/// Create a private repo with a README commit so its default branch exists.
+pub fn create_github_repo(slug: &str) -> Result<(), GitError> {
+    gh_stdout(&["repo", "create", slug, "--private", "--add-readme"]).map(|_| ())
 }
 
 pub fn clone_github_repo(slug: &str, dest: &Path) -> Result<(), GitError> {
